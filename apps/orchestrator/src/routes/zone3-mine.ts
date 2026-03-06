@@ -28,10 +28,9 @@ export function attachZone3MineRoutes(app: express.Express, deps: { zone3MinerMa
     }
   });
 
-  app.post("/api/zone3/mine", async (req, res) => {
+  app.post("/api/zone3/mine", async (_req, res) => {
     try {
-      const params = parseZone3MineParams(req.body ?? {});
-      const status = await zone3MinerManager.startMining(params);
+      const status = await zone3MinerManager.startMining();
       res.status(202).json({
         ok: true,
         status
@@ -44,55 +43,4 @@ export function attachZone3MineRoutes(app: express.Express, deps: { zone3MinerMa
       });
     }
   });
-}
-
-function parseZone3MineParams(raw: unknown): { startDate: string; endDate: string; symbols: string[] } {
-  const body = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  const today = new Date();
-  const startDefault = new Date(today.getTime() - 1000 * 60 * 60 * 24 * 365 * 2);
-  const startDate = normalizeYmd(String(body.startDate ?? ""), toYmd(startDefault));
-  const endDate = normalizeYmd(String(body.endDate ?? ""), toYmd(today));
-
-  const rawSymbols = Array.isArray(body.symbols)
-    ? body.symbols
-    : String(body.symbols ?? "")
-        .split(",")
-        .map((token) => token.trim());
-
-  const deduped: string[] = [];
-  const seen = new Set<string>();
-  for (const item of rawSymbols) {
-    const symbol = normalizeSymbol(String(item ?? ""));
-    if (!symbol || seen.has(symbol)) {
-      continue;
-    }
-    seen.add(symbol);
-    deduped.push(symbol);
-  }
-
-  const symbols = deduped.length > 0 ? deduped.slice(0, 30) : ["005930", "000660", "035420"];
-  return { startDate, endDate, symbols };
-}
-
-function normalizeYmd(raw: string, fallback: string): string {
-  const token = raw.trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(token)) {
-    return fallback;
-  }
-  return token;
-}
-
-function toYmd(date: Date): string {
-  const y = date.getFullYear();
-  const m = `${date.getMonth() + 1}`.padStart(2, "0");
-  const d = `${date.getDate()}`.padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
-
-function normalizeSymbol(raw: string): string | null {
-  const digits = String(raw ?? "").trim().replace(/[^\d]/g, "");
-  if (digits.length < 6) {
-    return null;
-  }
-  return digits.slice(0, 6);
 }

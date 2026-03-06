@@ -6,12 +6,6 @@ import readline from "node:readline";
 
 import oracledb from "oracledb";
 
-export interface Zone3MineParams {
-  startDate: string;
-  endDate: string;
-  symbols: string[];
-}
-
 export interface Zone3MiningStats {
   totalPatterns: number;
   classA: number;
@@ -26,7 +20,6 @@ export interface Zone3MiningState {
   progress: number;
   startedAt: string | null;
   updatedAt: string | null;
-  params: Zone3MineParams | null;
   processed: number;
   inserted: number;
   lastMessage: string;
@@ -46,7 +39,7 @@ export interface Zone3MiningSocketEvent {
 }
 
 export interface Zone3MinerManager {
-  startMining: (params: Zone3MineParams) => Promise<Zone3MiningState>;
+  startMining: () => Promise<Zone3MiningState>;
   getStatus: () => Zone3MiningState;
   getStats: () => Promise<Zone3MiningStats>;
   stopMining: () => void;
@@ -64,7 +57,6 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
     progress: 0,
     startedAt: null,
     updatedAt: null,
-    params: null,
     processed: 0,
     inserted: 0,
     lastMessage: "idle",
@@ -93,7 +85,7 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
     });
   }
 
-  async function startMining(params: Zone3MineParams): Promise<Zone3MiningState> {
+  async function startMining(): Promise<Zone3MiningState> {
     if (state.running) {
       throw new Error("Zone3 마이닝이 이미 실행 중입니다.");
     }
@@ -112,12 +104,6 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
     const args = [
       ...prefix,
       scriptPath,
-      "--start-date",
-      params.startDate,
-      "--end-date",
-      params.endDate,
-      "--symbols",
-      params.symbols.join(","),
       "--vector-dim",
       String(Math.max(128, Number(process.env.ZONE3_VECTOR_DIM ?? 1024)))
     ];
@@ -135,7 +121,6 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
       progress: 0,
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      params,
       processed: 0,
       inserted: 0,
       lastMessage: "zone3 mining started",
@@ -144,7 +129,7 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
 
     emit({
       type: "status",
-      message: `Zone3 마이닝 시작 (${params.startDate} ~ ${params.endDate})`,
+      message: "Zone3 마이닝 시작 (Auto: 최근 2년/자동 이어하기)",
       running: true,
       progress: 0
     });
@@ -233,7 +218,7 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
   }
 
   function getStatus(): Zone3MiningState {
-    return { ...state, params: state.params ? { ...state.params, symbols: [...state.params.symbols] } : null };
+    return { ...state };
   }
 
   async function getStats(): Promise<Zone3MiningStats> {

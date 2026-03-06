@@ -59,13 +59,6 @@ def to_symbol(raw: Any) -> str:
     return digits[:6].zfill(6) if digits else ""
 
 
-def parse_date(raw: str, fallback: dt.date) -> dt.date:
-    token = str(raw or "").strip()
-    if not token:
-        return fallback
-    return dt.datetime.strptime(token, "%Y-%m-%d").date()
-
-
 class HttpClient:
     def __init__(self) -> None:
         self.session = requests.Session()
@@ -419,6 +412,21 @@ def read_oracle_env() -> tuple[str, str, str]:
     return user, password, connect_string
 
 
+def fetch_existing_symbols_from_db() -> set[str]:
+    user, password, connect_string = read_oracle_env()
+    symbols: set[str] = set()
+    with oracledb.connect(user=user, password=password, dsn=connect_string) as conn:
+        with conn.cursor() as cur:
+            cur.execute("select distinct symbol from TB_ZONE3_PATTERN_LIBRARY where symbol is not null")
+            for row in cur:
+                if not row:
+                    continue
+                symbol = to_symbol(row[0])
+                if symbol:
+                    symbols.add(symbol)
+    return symbols
+
+
 def upsert_patterns(records: list[PatternRecord]) -> int:
     if not records:
         return 0
@@ -480,8 +488,6 @@ def iter_symbols(listing_df: pd.DataFrame, limit: int) -> Iterable[tuple[int, in
 
 def run() -> None:
     parser = argparse.ArgumentParser(description="Zone3 pattern library miner")
-    parser.add_argument("--start-date", default="")
-    parser.add_argument("--end-date", default="")
     parser.add_argument("--vector-dim", type=int, default=ZONE3_VECTOR_DIM)
     parser.add_argument("--symbol-limit", type=int, default=int(os.getenv("ZONE3_MINE_SYMBOL_LIMIT", "2000")))
     parser.add_argument("--max-events-per-symbol", type=int, default=int(os.getenv("ZONE3_MINE_MAX_EVENTS_PER_SYMBOL", "6")))
@@ -489,15 +495,31 @@ def run() -> None:
     args = parser.parse_args()
 
     today = dt.date.today()
-    start_date = parse_date(args.start_date, today - dt.timedelta(days=365 * 2))
-    end_date = parse_date(args.end_date, today)
-    if start_date > end_date:
-        start_date, end_date = end_date, start_date
+    start_date = today - dt.timedelta(days=365 * 2)
+    end_date = today
 
     exclude_keywords = [token.strip() for token in str(args.exclude_keywords).split(",") if token.strip()]
     listing = get_market_symbols(exclude_keywords=exclude_keywords)
     if listing.empty:
         raise RuntimeError("종목 마스터 리스트 수집 실패(FinanceDataReader)")
+    try:
+        existing_symbols = fetch_existing_symbols_from_db()
+    except Exception as exc:
+        emit("log", f"[DB] 기존 적재 종목 조회 실패, 전체 스캔으로 진행: {exc}", level="warn")
+        existing_symbols = set()
+
+    if existing_symbols:
+        listing = listing[~listing["Symbol"].isin(existing_symbols)].reset_index(drop=True)
+
+    if listing.empty:
+        emit(
+            "completed",
+            "이미 모든 종목이 적재되어 있어 작업할 대상이 없습니다.",
+            running=False,
+            progress=100,
+            inserted=0,
+        )
+        return
 
     http = HttpClient()
     kis = KisClient(http=http)
@@ -510,6 +532,7 @@ def run() -> None:
         start_date=str(start_date),
         end_date=str(end_date),
         symbols_total=min(args.symbol_limit, len(listing)),
+        resume_skip_symbols=len(existing_symbols),
         kis_enabled=kis.enabled,
     )
 

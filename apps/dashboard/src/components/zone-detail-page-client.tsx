@@ -116,9 +116,6 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
 
   const [reloadKey, setReloadKey] = useState(0);
   const [apiState, setApiState] = useState<ApiState>({ loading: true, error: null, payload: null, fetchedAt: null });
-  const [zone3StartDate, setZone3StartDate] = useState(() => toYmd(new Date(Date.now() - 1000 * 60 * 60 * 24 * 365 * 2)));
-  const [zone3EndDate, setZone3EndDate] = useState(() => toYmd(new Date()));
-  const [zone3Symbols, setZone3Symbols] = useState("005930,000660,035420");
   const [zone3Busy, setZone3Busy] = useState(false);
   const [zone3Error, setZone3Error] = useState<string | null>(null);
   const [zone3Stats, setZone3Stats] = useState<{
@@ -209,19 +206,8 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
         }
 
         if (statusResponse.ok) {
-          const payload = (await statusResponse.json()) as {
-            status?: { params?: { startDate?: string; endDate?: string; symbols?: string[] } };
-          };
-          const params = payload.status?.params;
-          if (params?.startDate) {
-            setZone3StartDate(params.startDate);
-          }
-          if (params?.endDate) {
-            setZone3EndDate(params.endDate);
-          }
-          if (params?.symbols && params.symbols.length > 0) {
-            setZone3Symbols(params.symbols.join(","));
-          }
+          // 상태 API는 running/progress/log 동기화 목적으로만 주기 조회한다.
+          await statusResponse.json();
         }
       } catch {
         // noop
@@ -264,20 +250,8 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
     setZone3Busy(true);
     setZone3Error(null);
     try {
-      const symbols = zone3Symbols
-        .split(",")
-        .map((token) => token.trim())
-        .filter(Boolean);
       const response = await fetch(`${ORCHESTRATOR_URL}/api/zone3/mine`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          startDate: zone3StartDate,
-          endDate: zone3EndDate,
-          symbols
-        })
+        method: "POST"
       });
       if (!response.ok) {
         const payload = (await response.json().catch(() => ({ error: "요청 실패" }))) as { error?: string };
@@ -370,37 +344,6 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
               </div>
             </div>
 
-            <div className="mt-3 grid gap-2 md:grid-cols-3">
-              <label className="text-xs text-slate-300">
-                시작일
-                <input
-                  type="date"
-                  value={zone3StartDate}
-                  onChange={(e) => setZone3StartDate(e.target.value)}
-                  className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-slate-100"
-                />
-              </label>
-              <label className="text-xs text-slate-300">
-                종료일
-                <input
-                  type="date"
-                  value={zone3EndDate}
-                  onChange={(e) => setZone3EndDate(e.target.value)}
-                  className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-slate-100"
-                />
-              </label>
-              <label className="text-xs text-slate-300">
-                종목코드 (CSV)
-                <input
-                  type="text"
-                  value={zone3Symbols}
-                  onChange={(e) => setZone3Symbols(e.target.value)}
-                  className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-slate-100"
-                  placeholder="005930,000660,035420"
-                />
-              </label>
-            </div>
-
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <button
                 type="button"
@@ -472,13 +415,6 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
       </footer>
     </main>
   );
-}
-
-function toYmd(date: Date): string {
-  const y = date.getFullYear();
-  const m = `${date.getMonth() + 1}`.padStart(2, "0");
-  const d = `${date.getDate()}`.padStart(2, "0");
-  return `${y}-${m}-${d}`;
 }
 
 function buildRows(
