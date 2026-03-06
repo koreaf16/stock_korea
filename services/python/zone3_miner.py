@@ -926,6 +926,11 @@ def load_or_fetch_minute(symbol: str, event_date: dt.date, kis: KisClient) -> pd
     if not cached.empty:
         return cached
 
+    # KIS 분봉 API(FHKST03010200)는 실질적으로 당일 분봉 위주로 반환된다.
+    # 캐시가 없는 과거 날짜는 호출해도 빈 결과일 가능성이 높아 API 호출을 생략한다.
+    if event_date != dt.date.today():
+        return pd.DataFrame()
+
     if not kis.enabled:
         return pd.DataFrame()
 
@@ -947,6 +952,7 @@ def sync_raw_data(
     symbol_limit: int,
     max_events_per_symbol: int,
 ) -> None:
+    today = dt.date.today()
     for idx, total, symbol, name in iter_symbols(listing, symbol_limit):
         emit("log", f"[SYNC {idx}/{total}] {symbol} {name} raw 수집", level="info")
 
@@ -964,8 +970,27 @@ def sync_raw_data(
             emit("log", f"[SYNC] {symbol} KIS 비활성화로 분봉 raw 수집 생략", level="warn")
             continue
 
+        minute_saved = 0
+        skipped_historical_minute = 0
         for event in events:
-            _ = load_or_fetch_minute(symbol, event.event_date, kis)
+            minute_df = load_or_fetch_minute(symbol, event.event_date, kis)
+            if not minute_df.empty:
+                minute_saved += 1
+                continue
+            if event.event_date != today and not minute_raw_path(symbol, event.event_date).exists():
+                skipped_historical_minute += 1
+
+        if skipped_historical_minute > 0:
+            emit(
+                "log",
+                f"[SYNC] {symbol} 과거 이벤트 {skipped_historical_minute}건은 KIS 분봉 제한(당일 위주)으로 raw 미수집",
+                level="warn",
+            )
+        emit(
+            "log",
+            f"[SYNC] {symbol} 분봉 raw 저장 {minute_saved}/{len(events)}",
+            level="info",
+        )
 
 
 def transform_and_upsert(

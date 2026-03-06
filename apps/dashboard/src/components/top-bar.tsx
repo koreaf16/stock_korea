@@ -1,198 +1,88 @@
-import type { DashboardSnapshot } from "@stock/contracts";
-import { ArrowUpRight, PanelsTopLeft } from "lucide-react";
-import Link from "next/link";
+"use client";
 
-import { formatKrw, formatPct } from "@/lib/format";
-import { connectionStateKo, serviceLabelKo, sourceKo } from "@/lib/korean";
+import Link from "next/link";
+import type { DashboardSnapshot } from "@stock/contracts";
+import { formatKrw } from "@/lib/format";
 import type { OrchestratorHealth } from "@/lib/orchestrator-health";
-import { formatSymbolLabel } from "@/lib/symbol-label";
 
 interface TopBarProps {
   connected: boolean;
   health: OrchestratorHealth | null;
-  healthError: string | null;
-  commandError: string | null;
   snapshot: DashboardSnapshot;
   busy: boolean;
-  newsFeed: Array<{
-    id: string;
-    source: "NAVER_NEWS" | "NAVER_BOARD";
-    symbol: string;
-    title: string;
-    timestamp: string;
-  }>;
-  symbolNames: Record<string, string>;
-  emergencyAlerts: string[];
   onToggleKillSwitch: (enabled: boolean) => Promise<void>;
+  emergencyAlerts?: string[];
 }
 
-export function TopBar({
-  connected,
-  health,
-  healthError,
-  commandError,
-  snapshot,
-  busy,
-  newsFeed,
-  symbolNames,
-  emergencyAlerts,
-  onToggleKillSwitch
-}: TopBarProps) {
-  const zoneSummary = [
-    `존2 ${sourceKo(health?.zone2.source)}`,
-    `존3 ${sourceKo(health?.zone3.source)}`,
-    `존4 ${sourceKo(health?.zone4.source)}`,
-    `존5 ${sourceKo(health?.zone5.source)}`,
-    `존6 ${sourceKo(health?.zone6.source)}`
-  ];
-  const latestNews = newsFeed.filter((item) => item.source === "NAVER_NEWS").slice(0, 10);
-  const tickerItems = latestNews.length > 0 ? latestNews : newsFeed.slice(0, 10);
-  const tickerLoop = [...tickerItems, ...tickerItems];
+export function TopBar({ connected, health, snapshot, busy, onToggleKillSwitch, emergencyAlerts = [] }: TopBarProps) {
+  // 3-Dots Status Calculation
+  const kisOk = connected && (health?.zone0?.ticksBuffered ?? 0) >= 0;
+  const dbOk = connected; // DB is assumed OK if orchestrator sends socket
+  const llmOk = !health?.zone5?.lastError;
+
+  const StatusDot = ({ ok, label }: { ok: boolean; label: string }) => (
+    <div className="flex items-center gap-1.5">
+      <span className={`h-1.5 w-1.5 rounded-full ${ok ? "bg-cyan-500 shadow-[0_0_5px_rgba(6,182,212,0.8)]" : "bg-rose-500 animate-pulse"}`} />
+      <span className={`text-[9px] tracking-[0.2em] ${ok ? "text-zinc-400" : "text-rose-500"}`}>{label}</span>
+    </div>
+  );
 
   return (
-    <header className="panel-surface sticky top-2 z-40 mb-3 rounded-2xl px-4 py-3">
-      <div className="flex flex-col gap-3">
-        {emergencyAlerts.length > 0 ? (
-          <div className="rounded-xl border border-rose-400/80 bg-rose-500/14 px-3 py-2">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-rose-200">긴급 경고 묶음</p>
-            <div className="mt-1 flex flex-wrap gap-1.5">
-              {emergencyAlerts.map((alert) => (
-                <span
-                  key={alert}
-                  className="rounded-full border border-rose-400/70 bg-rose-500/18 px-2 py-0.5 text-[11px] font-semibold text-rose-100"
-                >
-                  {alert}
-                </span>
-              ))}
-            </div>
-          </div>
-        ) : null}
-
-        <div className="min-w-0">
-          <p className="text-[11px] uppercase tracking-[0.24em] text-slate-400">글로벌 상태</p>
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            {snapshot.network.map((service) => {
-              const isUp = service.state === "UP";
-              return (
-                <div
-                  key={service.name}
-                  className="rounded-lg border border-slate-700/80 bg-slate-950/50 px-2 py-1 text-[11px] text-slate-200"
-                >
-                  <p className="inline-flex items-center gap-1 font-semibold tracking-wide">
-                    <i className={`h-2 w-2 rounded-full ${isUp ? "bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.7)]" : "bg-rose-500"}`} />
-                    {serviceLabelKo(service.name)}
-                  </p>
-                  <p className="mt-0.5 text-[10px] text-slate-400">{connectionStateKo(service.state)}</p>
-                  <p className="mt-0.5 max-w-[180px] truncate text-[10px] text-slate-400">{service.endpoint}</p>
-                </div>
-              );
-            })}
-            <span
-              className={`rounded-full border px-2 py-1 text-[11px] ${
-                connected
-                  ? "border-emerald-500/40 bg-emerald-500/20 text-emerald-300"
-                  : "border-rose-500/40 bg-rose-500/20 text-rose-300"
-              }`}
-            >
-              {connected ? "소켓 연결됨" : "소켓 끊김"}
-            </span>
-            {healthError ? (
-              <span className="rounded-full border border-amber-500/50 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-300">
-                상태 점검 경고
-              </span>
-            ) : null}
-            {commandError ? (
-              <span className="rounded-full border border-rose-500/50 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-300">
-                명령 오류
-              </span>
-            ) : null}
-            <span className="rounded-full border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-[11px] text-slate-300">
-              {health?.now ? `최근 갱신 ${health.now}` : "상태 수집 대기"}
-            </span>
-          </div>
+    <div className="flex h-10 shrink-0 items-center justify-between border-b border-zinc-800/80 bg-black px-4 font-mono">
+      {/* LEFT: System Core Status & Zone Nav */}
+      <div className="flex items-center gap-4">
+        <span className="text-[10px] tracking-[0.3em] text-zinc-600 font-bold hidden sm:inline">SYS_CORE</span>
+        <div className="flex items-center gap-3">
+          <StatusDot ok={kisOk} label="KIS" />
+          <StatusDot ok={dbOk} label="ORA" />
+          <StatusDot ok={llmOk} label="LLM" />
         </div>
+
+        {/* ZONE NAVIGATION BUTTONS */}
+        <div className="ml-2 flex items-center gap-1 border-l border-zinc-800/80 pl-4">
+          {[0, 1, 2, 3, 4, 5, 6].map((z) => (
+            <Link
+              key={z}
+              href={`/zone/${z}`}
+              className="rounded border border-transparent px-1.5 py-0.5 text-[9px] font-bold text-zinc-500 transition-all hover:border-zinc-700 hover:bg-zinc-900 hover:text-cyan-400"
+            >
+              Z{z}
+            </Link>
+          ))}
+        </div>
+
+        {emergencyAlerts.length > 0 && (
+          <span className="ml-4 text-[9px] font-bold text-rose-500 animate-pulse tracking-widest hidden md:inline">
+            ! WARN: {emergencyAlerts[0]}
+          </span>
+        )}
       </div>
 
-      <div className="mt-3 flex flex-col gap-3 lg:flex-row lg:flex-wrap lg:items-center">
-        <div className="rounded-xl border border-slate-700/70 bg-slate-900/60 px-3 py-2 lg:min-w-[280px] xl:min-w-[360px]">
-          <p className="text-[11px] uppercase tracking-[0.24em] text-slate-400">내 계좌</p>
-          <div className="mt-1 flex flex-wrap items-center gap-4 text-sm text-slate-100">
-            <span className="font-semibold">총 자산 {formatKrw(snapshot.account.totalAssets)} 원</span>
-            <span>예수금 {formatKrw(snapshot.account.cashAvailable)} 원</span>
-            <span className={snapshot.account.realizedPnlPct >= 0 ? "text-rose-300" : "text-blue-300"}>
-              당일 실현손익 {formatPct(snapshot.account.realizedPnlPct)}
+      {/* RIGHT: Portfolio & Master Kill Switch */}
+      <div className="flex items-center gap-5">
+        <div className="flex items-center gap-3 text-[10px] tracking-wider hidden sm:flex">
+          <span className="text-zinc-600">
+            ASSET: <span className="text-zinc-200 font-bold">{formatKrw(snapshot.account.totalAsset)}</span>
+          </span>
+          <span className="text-zinc-600">
+            PNL: <span className={`font-bold ${snapshot.account.realizedPnl >= 0 ? "text-cyan-400" : "text-rose-500"}`}>
+              {formatKrw(snapshot.account.realizedPnl)}
             </span>
-          </div>
-        </div>
-
-        <div className="min-w-0 flex-1 rounded-xl border border-slate-700/70 bg-slate-900/60 px-3 py-2">
-          <p className="text-[11px] uppercase tracking-[0.24em] text-slate-400">최신 뉴스 스트림</p>
-          <div className="relative mt-1 h-6 overflow-hidden">
-            {tickerItems.length === 0 ? (
-              <p className="text-xs text-slate-500">뉴스 수신 대기 중</p>
-            ) : (
-              <div
-                className="absolute left-0 top-0 flex min-w-full items-center whitespace-nowrap"
-                style={{ animation: "topbarNewsMarquee 36s linear infinite" }}
-              >
-                {tickerLoop.map((item, index) => (
-                  <span
-                    key={`${item.id}:${index}`}
-                    className="mr-7 inline-flex max-w-[340px] items-center gap-2 text-xs text-slate-200"
-                  >
-                    <span className="font-semibold text-cyan-300">{formatSymbolLabel(item.symbol, symbolNames)}</span>
-                    <span className="truncate">{item.title}</span>
-                    <span className="text-[10px] text-slate-500">{item.source === "NAVER_NEWS" ? "뉴스" : "종토방"}</span>
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
+          </span>
         </div>
 
         <button
-          type="button"
-          disabled={busy}
           onClick={() => onToggleKillSwitch(!snapshot.killSwitchOn)}
-          className={`self-start rounded-lg border px-4 py-2 text-sm font-semibold tracking-wide transition lg:shrink-0 lg:self-auto ${
-            snapshot.killSwitchOn
-              ? "border-rose-300/40 bg-rose-800 text-rose-50 hover:bg-rose-700"
-              : "border-rose-500/50 bg-rose-500 text-rose-50 hover:bg-rose-400"
-          } disabled:cursor-not-allowed disabled:opacity-60`}
+          disabled={busy}
+          className={`flex h-6 items-center justify-center px-4 text-[9px] font-bold tracking-[0.2em] transition-colors ${
+            snapshot.killSwitchOn 
+              ? "bg-rose-600 text-white animate-pulse" 
+              : "border border-rose-900/50 text-rose-500 hover:bg-rose-950/30"
+          }`}
         >
-          마스터 킬스위치 {snapshot.killSwitchOn ? "작동" : "해제"}
+          {snapshot.killSwitchOn ? "SYS_HALTED" : "KILL_SWITCH"}
         </button>
       </div>
-
-      <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-slate-700/70 bg-slate-900/60 px-3 py-2">
-        <span className="text-xs text-slate-400">틱 수</span>
-        <span className="text-sm font-semibold text-slate-100">{health?.tickCount ?? "-"}</span>
-        <span className="h-4 w-px bg-slate-700/80" />
-        {zoneSummary.map((item) => (
-          <span key={item} className="rounded-full bg-slate-800 px-2 py-0.5 text-[11px] text-slate-200">
-            {item}
-          </span>
-        ))}
-        <Link
-          href="/zones"
-          className="inline-flex items-center gap-1 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-1 text-[11px] text-cyan-200 transition hover:bg-cyan-500/20"
-        >
-          <PanelsTopLeft className="h-3.5 w-3.5" />
-          존 관리
-          <ArrowUpRight className="h-3.5 w-3.5" />
-        </Link>
-      </div>
-
-      <style jsx>{`
-        @keyframes topbarNewsMarquee {
-          0% {
-            transform: translateX(0);
-          }
-          100% {
-            transform: translateX(-50%);
-          }
-        }
-      `}</style>
-    </header>
+    </div>
   );
 }

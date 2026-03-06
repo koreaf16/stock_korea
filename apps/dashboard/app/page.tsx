@@ -1,10 +1,8 @@
 "use client";
 
-import type { OrderSide } from "@stock/contracts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CenterPanel } from "@/components/center-panel";
-import { LeftPanel } from "@/components/left-panel";
 import { RightPanel } from "@/components/right-panel";
 import { TopBar } from "@/components/top-bar";
 import { useDashboardHealth } from "@/lib/use-dashboard-health";
@@ -16,28 +14,10 @@ const ORCHESTRATOR_URL = process.env.NEXT_PUBLIC_ORCHESTRATOR_URL ?? "http://loc
 
 async function postJson(path: string, body: Record<string, unknown>): Promise<void> {
   const response = await fetch(`${ORCHESTRATOR_URL}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
   });
-
-  if (response.ok) {
-    return;
-  }
-
-  let message = `request failed (${response.status})`;
-  try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload?.error === "string" && payload.error.trim().length > 0) {
-      message = payload.error;
-    }
-  } catch {
-    // noop
-  }
-
-  throw new Error(message);
+  if (response.ok) return;
+  throw new Error("Command failed");
 }
 
 export default function DashboardPage() {
@@ -49,9 +29,6 @@ export default function DashboardPage() {
   const healthError = useDashboardStore((state) => state.healthError);
   const snapshot = useDashboardStore((state) => state.snapshot);
   const priceSeries = useDashboardStore((state) => state.priceSeries);
-  const tickLogs = useDashboardStore((state) => state.tickLogs);
-  const brainLogs = useDashboardStore((state) => state.brainLogs);
-  const targetLogs = useDashboardStore((state) => state.targetLogs);
   const newsBoardFeed = useDashboardStore((state) => state.newsBoardFeed);
   const symbolNames = useDashboardStore((state) => state.symbolNames);
   const mergeSymbolNames = useDashboardStore((state) => state.mergeSymbolNames);
@@ -61,171 +38,87 @@ export default function DashboardPage() {
   const [commandError, setCommandError] = useState<string | null>(null);
 
   const handleToggleKillSwitch = useCallback(async (enabled: boolean) => {
-    setBusy(true);
-    setCommandError(null);
-    try {
-      await postJson("/api/kill-switch", { enabled });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "킬스위치 요청 실패";
-      setCommandError(message);
-    } finally {
-      setBusy(false);
-    }
+    setBusy(true); setCommandError(null);
+    try { await postJson("/api/kill-switch", { enabled }); } 
+    catch (error) { setCommandError("킬스위치 실패"); } 
+    finally { setBusy(false); }
   }, []);
-
-  const handleManualOrder = useCallback(
-    async (side: OrderSide, qty: number) => {
-      setBusy(true);
-      setCommandError(null);
-      try {
-        await postJson("/api/manual-order", {
-          symbol: snapshot.targetSymbol,
-          side,
-          qty: Math.max(1, Math.floor(qty))
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "수동 주문 요청 실패";
-        setCommandError(message);
-      } finally {
-        setBusy(false);
-      }
-    },
-    [snapshot.targetSymbol]
-  );
 
   const symbolCandidates = useMemo(() => {
     const values: string[] = [
-      snapshot.targetSymbol,
-      snapshot.tick.symbol,
-      snapshot.fundamental.symbol,
+      snapshot.targetSymbol, snapshot.tick.symbol, snapshot.fundamental.symbol,
       ...snapshot.watchPool.map((item) => item.symbol),
-      ...snapshot.positions.map((position) => position.symbol),
-      ...snapshot.orderLog.slice(0, 40).map((log) => log.symbol),
-      ...newsBoardFeed.slice(0, 40).map((item) => item.symbol)
+      ...snapshot.positions.map((position) => position.symbol)
     ];
-
     const deduped: string[] = [];
     const seen = new Set<string>();
     for (const value of values) {
       const code = toSymbolCode(value);
-      if (!/^\d{6}$/.test(code) || seen.has(code)) {
-        continue;
-      }
-      seen.add(code);
-      deduped.push(code);
+      if (!/^\d{6}$/.test(code) || seen.has(code)) continue;
+      seen.add(code); deduped.push(code);
     }
     return deduped;
-  }, [newsBoardFeed, snapshot.fundamental.symbol, snapshot.orderLog, snapshot.positions, snapshot.targetSymbol, snapshot.tick.symbol, snapshot.watchPool]);
+  }, [snapshot.fundamental.symbol, snapshot.positions, snapshot.targetSymbol, snapshot.tick.symbol, snapshot.watchPool]);
 
   const emergencyAlerts = useMemo(() => {
     const alerts: string[] = [];
-    if (!connected) {
-      alerts.push("소켓 연결 끊김");
-    }
-    if (healthError) {
-      alerts.push(`헬스체크 실패: ${healthError}`);
-    }
-    if (snapshot.killSwitchOn) {
-      alerts.push("마스터 킬스위치 작동 중");
-    }
-    if (snapshot.technical.spikeRatio >= 300) {
-      alerts.push(`존1 거래대금 급증 ${snapshot.technical.spikeRatio.toFixed(1)}%`);
-    }
-    if (snapshot.fundamental.riskFlag === "BLOCKED") {
-      alerts.push("존2 펀더멘털 차단");
-    }
-    if (health?.zone5.lastError) {
-      alerts.push(`존5 오류: ${health.zone5.lastError}`);
-    }
-    if (health?.zone6.lastError) {
-      alerts.push(`존6 오류: ${health.zone6.lastError}`);
-    }
+    if (!connected) alerts.push("SYS_OFFLINE");
+    if (snapshot.killSwitchOn) alerts.push("KILL_SWITCH_ACTIVE");
+    if (snapshot.technical.spikeRatio >= 300) alerts.push(`VOLUME_SPIKE_${snapshot.technical.spikeRatio.toFixed(0)}%`);
     return alerts;
-  }, [connected, health, healthError, snapshot.fundamental.riskFlag, snapshot.killSwitchOn, snapshot.technical.spikeRatio]);
+  }, [connected, snapshot.killSwitchOn, snapshot.technical.spikeRatio]);
 
   useEffect(() => {
     const missing = symbolCandidates.filter((code) => !symbolNames[code] && !pendingSymbolsRef.current.has(code));
-    if (missing.length === 0) {
-      return;
-    }
-
-    for (const code of missing) {
-      pendingSymbolsRef.current.add(code);
-    }
-
+    if (missing.length === 0) return;
+    for (const code of missing) pendingSymbolsRef.current.add(code);
+    
     let cancelled = false;
-
     const fetchNames = async () => {
       try {
-        const response = await fetch(`${ORCHESTRATOR_URL}/api/symbol-names?symbols=${missing.join(",")}`, {
-          method: "GET",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          cache: "no-store"
-        });
-
-        if (!response.ok) {
-          return;
-        }
-
-        const payload = (await response.json()) as {
-          ok?: boolean;
-          items?: Array<{ symbol?: string; name?: string }>;
-        };
-        if (cancelled || !Array.isArray(payload.items)) {
-          return;
-        }
-
+        const response = await fetch(`${ORCHESTRATOR_URL}/api/symbol-names?symbols=${missing.join(",")}`, { method: "GET" });
+        if (!response.ok) return;
+        const payload = (await response.json()) as { items?: Array<{ symbol?: string; name?: string }> };
+        if (cancelled || !Array.isArray(payload.items)) return;
+        
         const entries: Record<string, string> = {};
         for (const item of payload.items) {
           const code = toSymbolCode(item?.symbol);
           const name = String(item?.name ?? "").trim();
-          if (!/^\d{6}$/.test(code) || !name) {
-            continue;
-          }
-          entries[code] = name;
+          if (/^\d{6}$/.test(code) && name) entries[code] = name;
         }
-
         mergeSymbolNames(entries);
       } finally {
-        for (const code of missing) {
-          pendingSymbolsRef.current.delete(code);
-        }
+        for (const code of missing) pendingSymbolsRef.current.delete(code);
       }
     };
-
     void fetchNames();
-
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [mergeSymbolNames, symbolCandidates, symbolNames]);
 
   return (
-    <main className="flex min-h-screen flex-col overflow-x-hidden overflow-y-auto bg-slate-950 p-2 text-slate-100">
+    <main className="flex h-screen flex-col overflow-hidden bg-black p-2 text-zinc-300 font-sans selection:bg-cyan-900">
       <TopBar
-        connected={connected}
-        health={health}
-        healthError={healthError}
-        commandError={commandError}
-        snapshot={snapshot}
-        busy={busy}
-        newsFeed={newsBoardFeed}
-        symbolNames={symbolNames}
-        emergencyAlerts={emergencyAlerts}
-        onToggleKillSwitch={handleToggleKillSwitch}
+        connected={connected} health={health} healthError={healthError}
+        commandError={commandError} snapshot={snapshot} busy={busy}
+        newsFeed={newsBoardFeed} symbolNames={symbolNames}
+        emergencyAlerts={emergencyAlerts} onToggleKillSwitch={handleToggleKillSwitch}
       />
 
-      <section className="grid grid-cols-1 items-start gap-3 xl:grid-cols-[minmax(260px,320px)_minmax(0,1fr)] 2xl:grid-cols-[minmax(280px,340px)_minmax(0,1fr)_minmax(300px,390px)]">
-        <div className="min-w-0">
-          <LeftPanel snapshot={snapshot} health={health} tickLogs={tickLogs} targetLogs={targetLogs} symbolNames={symbolNames} />
+      <section className="mt-2 flex flex-1 gap-4 overflow-hidden">
+        {/* Left: Minimalist Chart */}
+        <div className="relative flex-[3] min-w-0 border border-zinc-800/50 bg-black overflow-hidden">
+          <CenterPanel snapshot={snapshot} health={health} priceSeries={priceSeries} symbolNames={symbolNames} />
         </div>
-        <div className="min-w-0">
-          <CenterPanel snapshot={snapshot} health={health} priceSeries={priceSeries} brainLogs={brainLogs} />
-        </div>
-        <div className="min-w-0 xl:col-span-2 2xl:col-span-1">
-          <RightPanel snapshot={snapshot} health={health} busy={busy} onManualOrder={handleManualOrder} symbolNames={symbolNames} />
+
+        {/* Right: Tactical Control (No Manual Orders) */}
+        <div className="flex-[1] min-w-[360px] max-w-[420px] overflow-y-auto pr-1">
+          <RightPanel 
+            snapshot={snapshot} 
+            health={health} 
+            symbolNames={symbolNames}
+            newsFeed={newsBoardFeed}
+          />
         </div>
       </section>
     </main>
