@@ -22,6 +22,7 @@ interface TopBarProps {
     timestamp: string;
   }>;
   symbolNames: Record<string, string>;
+  emergencyAlerts: string[];
   onToggleKillSwitch: (enabled: boolean) => Promise<void>;
 }
 
@@ -34,6 +35,7 @@ export function TopBar({
   busy,
   newsFeed,
   symbolNames,
+  emergencyAlerts,
   onToggleKillSwitch
 }: TopBarProps) {
   const zoneSummary = [
@@ -50,6 +52,22 @@ export function TopBar({
   return (
     <header className="panel-surface sticky top-2 z-40 mb-3 rounded-2xl px-4 py-3">
       <div className="flex flex-col gap-3">
+        {emergencyAlerts.length > 0 ? (
+          <div className="rounded-xl border border-rose-400/80 bg-rose-500/14 px-3 py-2">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-rose-200">긴급 경고 묶음</p>
+            <div className="mt-1 flex flex-wrap gap-1.5">
+              {emergencyAlerts.map((alert) => (
+                <span
+                  key={alert}
+                  className="rounded-full border border-rose-400/70 bg-rose-500/18 px-2 py-0.5 text-[11px] font-semibold text-rose-100"
+                >
+                  {alert}
+                </span>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
         <div className="min-w-0">
           <p className="text-[11px] uppercase tracking-[0.24em] text-slate-400">글로벌 상태</p>
           <div className="mt-2 flex flex-wrap items-center gap-2">

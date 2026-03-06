@@ -117,6 +117,32 @@ export default function DashboardPage() {
     return deduped;
   }, [newsBoardFeed, snapshot.fundamental.symbol, snapshot.orderLog, snapshot.positions, snapshot.targetSymbol, snapshot.tick.symbol, snapshot.watchPool]);
 
+  const emergencyAlerts = useMemo(() => {
+    const alerts: string[] = [];
+    if (!connected) {
+      alerts.push("소켓 연결 끊김");
+    }
+    if (healthError) {
+      alerts.push(`헬스체크 실패: ${healthError}`);
+    }
+    if (snapshot.killSwitchOn) {
+      alerts.push("마스터 킬스위치 작동 중");
+    }
+    if (snapshot.technical.spikeRatio >= 300) {
+      alerts.push(`존1 거래대금 급증 ${snapshot.technical.spikeRatio.toFixed(1)}%`);
+    }
+    if (snapshot.fundamental.riskFlag === "BLOCKED") {
+      alerts.push("존2 펀더멘털 차단");
+    }
+    if (health?.zone5.lastError) {
+      alerts.push(`존5 오류: ${health.zone5.lastError}`);
+    }
+    if (health?.zone6.lastError) {
+      alerts.push(`존6 오류: ${health.zone6.lastError}`);
+    }
+    return alerts;
+  }, [connected, health, healthError, snapshot.fundamental.riskFlag, snapshot.killSwitchOn, snapshot.technical.spikeRatio]);
+
   useEffect(() => {
     const missing = symbolCandidates.filter((code) => !symbolNames[code] && !pendingSymbolsRef.current.has(code));
     if (missing.length === 0) {
@@ -177,7 +203,7 @@ export default function DashboardPage() {
   }, [mergeSymbolNames, symbolCandidates, symbolNames]);
 
   return (
-    <main className="flex min-h-screen flex-col overflow-y-auto overflow-x-hidden bg-slate-950 p-2 text-slate-100">
+    <main className="flex min-h-screen flex-col overflow-x-hidden overflow-y-auto bg-slate-950 p-2 text-slate-100">
       <TopBar
         connected={connected}
         health={health}
@@ -187,17 +213,18 @@ export default function DashboardPage() {
         busy={busy}
         newsFeed={newsBoardFeed}
         symbolNames={symbolNames}
+        emergencyAlerts={emergencyAlerts}
         onToggleKillSwitch={handleToggleKillSwitch}
       />
 
-      <section className="grid grid-cols-1 items-start gap-3 xl:grid-cols-[minmax(300px,340px)_minmax(0,1fr)_minmax(330px,390px)] 2xl:grid-cols-[360px_minmax(0,1fr)_420px]">
+      <section className="grid grid-cols-1 items-start gap-3 xl:grid-cols-[minmax(260px,320px)_minmax(0,1fr)] 2xl:grid-cols-[minmax(280px,340px)_minmax(0,1fr)_minmax(300px,390px)]">
         <div className="min-w-0">
           <LeftPanel snapshot={snapshot} health={health} tickLogs={tickLogs} targetLogs={targetLogs} symbolNames={symbolNames} />
         </div>
         <div className="min-w-0">
           <CenterPanel snapshot={snapshot} health={health} priceSeries={priceSeries} brainLogs={brainLogs} />
         </div>
-        <div className="min-w-0">
+        <div className="min-w-0 xl:col-span-2 2xl:col-span-1">
           <RightPanel snapshot={snapshot} health={health} busy={busy} onManualOrder={handleManualOrder} symbolNames={symbolNames} />
         </div>
       </section>

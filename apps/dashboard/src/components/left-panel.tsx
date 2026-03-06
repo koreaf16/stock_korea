@@ -30,7 +30,7 @@ export function LeftPanel({ snapshot, health, tickLogs, targetLogs, symbolNames 
     <Panel
       title="레이더 및 존 1"
       subtitle="시장 감시 / 원시 데이터 / 펀더멘털 필터"
-      className="h-full min-w-0 overflow-hidden"
+      className="h-full min-w-0"
       rightSlot={
         <span className="rounded-full border border-slate-700/80 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
           존0 {health?.zone0.ticksBuffered ?? 0}틱
@@ -48,18 +48,6 @@ export function LeftPanel({ snapshot, health, tickLogs, targetLogs, symbolNames 
             <p className="mt-1 text-lg font-semibold text-slate-100">{health?.zone0.telegramBuffered ?? 0}</p>
           </div>
         </div>
-
-        {spikeDanger ? (
-          <div className="zone-alert-flash rounded-lg border border-rose-500/80 bg-rose-500/18 px-3 py-2">
-            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-rose-200">긴급 경보</p>
-            <p className="mt-1 text-sm font-semibold text-rose-100">
-              거래대금 급증 감지: {targetLabel} / {snapshot.technical.spikeRatio.toFixed(1)}%
-            </p>
-            <p className="text-[11px] text-rose-200/90">
-              존1 임계값(300%) 초과. 추격 진입 전 존2/존5 조건을 재확인하세요.
-            </p>
-          </div>
-        ) : null}
 
         <div className="rounded-lg border border-slate-700/60 bg-slate-900/55 p-2.5">
           <div className="mb-1 flex items-center justify-between">

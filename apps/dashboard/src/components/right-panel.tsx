@@ -58,7 +58,7 @@ export function RightPanel({ snapshot, health, busy, onManualOrder, symbolNames 
               비중 {snapshot.decision.suggestedWeightPct.toFixed(0)}%
             </span>
           </div>
-          <p className="mt-1 max-h-10 overflow-hidden text-xs text-slate-300">{narrativeKo(snapshot.decision.reasoning)}</p>
+          <p className="mt-1 max-h-10 overflow-hidden break-words text-xs text-slate-300">{narrativeKo(snapshot.decision.reasoning)}</p>
           <p className="mt-2 text-[11px] text-slate-400">
             목표가 {snapshot.decision.targetPrice?.toLocaleString() ?? "-"} / 손절가 {snapshot.decision.stopPrice?.toLocaleString() ?? "-"}
           </p>
