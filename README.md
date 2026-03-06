@@ -27,11 +27,15 @@ docs/             # Original architecture notes
 ```bash
 npm install
 ```
-2. Run both apps
+2. Install Python worker dependencies (Zone2/3/4/6)
+```bash
+py -3 -m pip install -r services/python/requirements.txt
+```
+3. Run both apps
 ```bash
 npm run dev
 ```
-3. Open dashboard
+4. Open dashboard
 - `http://localhost:5000`
 
 ## Database bootstrap (Oracle)

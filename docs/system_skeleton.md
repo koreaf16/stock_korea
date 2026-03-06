@@ -26,7 +26,7 @@ DB 생성/운영 관련 내용은 `docs/db.md`를 기준으로 관리합니다.
 - Zone table mapping:
   - Zone0: `TB_ZONE0_EVENT_RAW`
   - Zone1: `TB_ZONE1_TECHNICAL_LOG`
-  - Zone2: `TB_STOCK_FUNDAMENTAL`
+  - Zone2: `TB_ZONE2_FUNDAMENTAL`
   - Zone3: `TB_ZONE3_PATTERN_LIBRARY` (+ `IX_Z3_PATTERN_VEC`)
   - Zone4: `TB_ZONE4_MADNESS_LOG`
   - Zone5: `TB_ZONE5_DECISION_LOG`

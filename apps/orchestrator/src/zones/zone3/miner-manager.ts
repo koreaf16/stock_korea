@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
@@ -51,6 +51,8 @@ interface OracleEnv {
   connectString: string;
 }
 
+const ZONE3_REQUIRED_PYTHON_MODULES = ["numpy", "oracledb", "pandas", "requests"] as const;
+
 export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent) => void): Zone3MinerManager {
   let state: Zone3MiningState = {
     running: false,
@@ -95,11 +97,11 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
       throw new Error("services/python/zone3_miner.py 경로를 찾을 수 없습니다.");
     }
 
-    const command = (process.env.ZONE3_PYTHON_CMD ?? "python").trim();
-    const [pythonCmd, ...prefix] = command.split(/\s+/).filter(Boolean);
+    const { pythonCmd, prefix } = resolvePythonCommand();
     if (!pythonCmd) {
       throw new Error("ZONE3_PYTHON_CMD 설정이 비어 있습니다.");
     }
+    ensureZone3PythonDependencies(pythonCmd, prefix);
 
     const args = [
       ...prefix,
@@ -110,7 +112,7 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
 
     const proc = spawn(pythonCmd, args, {
       cwd: process.cwd(),
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
       stdio: ["ignore", "pipe", "pipe"]
     });
     child = proc;
@@ -129,7 +131,7 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
 
     emit({
       type: "status",
-      message: "Zone3 마이닝 시작 (Auto: 최근 2년/자동 이어하기)",
+      message: `Zone3 마이닝 시작 (Auto: 최근 2년/자동 이어하기, cmd=${pythonCmd})`,
       running: true,
       progress: 0
     });
@@ -139,11 +141,14 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
 
     proc.on("close", (code, signal) => {
       const finishedOk = code === 0;
+      const failedByMissingPython = code === 9009;
       emit({
         type: finishedOk ? "completed" : "error",
         message: finishedOk
           ? `Zone3 마이닝 프로세스 종료(code=${code ?? 0})`
-          : `Zone3 마이닝 실패(code=${code ?? -1}, signal=${signal ?? "-"})`,
+          : failedByMissingPython
+            ? "Zone3 마이닝 실패: Python 실행 파일을 찾지 못했습니다. .env.local에 ZONE3_PYTHON_CMD=py -3 를 설정하세요."
+            : `Zone3 마이닝 실패(code=${code ?? -1}, signal=${signal ?? "-"})`,
         running: false,
         progress: finishedOk ? 100 : state.progress,
         level: finishedOk ? "info" : "error"
@@ -361,4 +366,82 @@ function clampPercent(value: number): number {
     return 0;
   }
   return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function resolvePythonCommand(): { pythonCmd: string; prefix: string[] } {
+  const fromEnv = (process.env.ZONE3_PYTHON_CMD ?? "").trim();
+  if (fromEnv) {
+    const [pythonCmd, ...prefix] = fromEnv.split(/\s+/).filter(Boolean);
+    return { pythonCmd: pythonCmd ?? "", prefix };
+  }
+
+  const candidates: Array<{ cmd: string; prefix: string[] }> = process.platform === "win32"
+    ? [
+        { cmd: "py", prefix: ["-3"] },
+        { cmd: "python", prefix: [] },
+        { cmd: "python3", prefix: [] }
+      ]
+    : [
+        { cmd: "python3", prefix: [] },
+        { cmd: "python", prefix: [] }
+      ];
+
+  for (const candidate of candidates) {
+    if (canRunPython(candidate.cmd, candidate.prefix)) {
+      return { pythonCmd: candidate.cmd, prefix: candidate.prefix };
+    }
+  }
+
+  const fallback = candidates[0];
+  if (fallback) {
+    return { pythonCmd: fallback.cmd, prefix: fallback.prefix };
+  }
+  return { pythonCmd: "python", prefix: [] };
+}
+
+function canRunPython(cmd: string, prefix: string[]): boolean {
+  const probe = spawnSync(cmd, [...prefix, "--version"], {
+    encoding: "utf8",
+    stdio: "pipe",
+    timeout: 3000
+  });
+  return probe.status === 0;
+}
+
+function ensureZone3PythonDependencies(pythonCmd: string, prefix: string[]): void {
+  const missingModules = findMissingPythonModules(pythonCmd, prefix, [...ZONE3_REQUIRED_PYTHON_MODULES]);
+  if (missingModules.length <= 0) {
+    return;
+  }
+
+  const requirementsPath = "services/python/requirements.txt";
+  const installCommand = [pythonCmd, ...prefix, "-m", "pip", "install", "-r", requirementsPath].join(" ");
+  throw new Error(
+    `Zone3 마이닝 실행 환경에 Python 모듈이 없습니다(${missingModules.join(", ")}). ` +
+      `먼저 '${installCommand}' 를 실행하세요.`
+  );
+}
+
+function findMissingPythonModules(pythonCmd: string, prefix: string[], moduleNames: string[]): string[] {
+  if (moduleNames.length <= 0) {
+    return [];
+  }
+
+  const importCode = moduleNames.map((moduleName) => `import ${moduleName}`).join("; ");
+  const probe = spawnSync(pythonCmd, [...prefix, "-c", importCode], {
+    encoding: "utf8",
+    stdio: "pipe",
+    timeout: 5000
+  });
+
+  if (probe.status === 0) {
+    return [];
+  }
+
+  const stderr = `${probe.stderr ?? ""}\n${probe.stdout ?? ""}`;
+  const missing = moduleNames.filter((moduleName) =>
+    stderr.includes(`No module named '${moduleName}'`) || stderr.includes(`No module named "${moduleName}"`)
+  );
+
+  return missing.length > 0 ? missing : ["unknown"];
 }

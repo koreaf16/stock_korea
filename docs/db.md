@@ -13,7 +13,7 @@ Zone0~6 운영을 위한 Oracle 기본 스키마를 `db/oracle/init_schema.sql`�
 ## 3. 테이블 매핑
 1. `TB_ZONE0_EVENT_RAW` (Zone0 raw event log, 일 단위 파티션)
 2. `TB_ZONE1_TECHNICAL_LOG` (Zone1 지표 로그, 일 단위 파티션)
-3. `TB_STOCK_FUNDAMENTAL` (Zone2 리스크 캐시/결과 테이블)
+3. `TB_ZONE2_FUNDAMENTAL` (Zone2 리스크 캐시/결과 테이블)
 4. `TB_ZONE3_PATTERN_LIBRARY` (Zone3 패턴 라이브러리 + `VECTOR(1024, FLOAT32)`)
 5. `TB_ZONE4_MADNESS_LOG` (Zone4 지수 로그, 일 단위 파티션)
 6. `TB_ZONE5_DECISION_LOG` (Zone5 의사결정 로그, 일 단위 파티션)

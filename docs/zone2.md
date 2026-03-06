@@ -14,7 +14,7 @@
 
 ## 4. 입출력 (I/O)
 * **Input**: DART API 및 외부 재무 크롤링 데이터
-* **Output**: Oracle DB `TB_STOCK_FUNDAMENTAL` 테이블에 종목별 리스크 플래그(True/False) 업데이트. 매매 직전 Node.js가 조회하여 False 시 즉시 PASS 처리.
+* **Output**: Oracle DB `TB_ZONE2_FUNDAMENTAL` 테이블에 종목별 리스크 플래그(True/False) 업데이트. 매매 직전 Node.js가 조회하여 False 시 즉시 PASS 처리.
 
 ## 5. 현재 구현 상태 (v0 Skeleton)
 아래 항목은 현재 코드에 반영된 Zone 2 구현 범위입니다.
@@ -59,12 +59,12 @@ Node.js Orchestrator에 `Zone2Engine`을 붙여 매 tick마다 아래 순서로 
 * `ZONE2_FORCE_BLOCKED_SYMBOLS` (강제 차단 심볼 목록)
 
 ### 5.7 현재 한계
-* Oracle `TB_STOCK_FUNDAMENTAL` 실DB read/write 로직은 아직 엔진에 미연결
+* Oracle `TB_ZONE2_FUNDAMENTAL` 실DB read/write 로직은 아직 엔진에 미연결
 * DART/KRX/FnGuide 실크롤링은 Python 워커 mock/deterministic 단계
 * 즉, 현재는 인터페이스/운영 플로우 중심의 skeleton 구현
 
 ### 5.8 DB 매핑 (생성 완료)
-* 리스크 캐시 테이블: `TB_STOCK_FUNDAMENTAL`
+* 리스크 캐시 테이블: `TB_ZONE2_FUNDAMENTAL`
 * 인덱스: `IX_Z2_FUND_CHECKED_AT`
 * DDL: `db/oracle/init_schema.sql`
 

@@ -7,7 +7,7 @@ column index_name format a24
 column locality format a10
 prompt === TABLES ===
 select table_name, partitioned from user_tables where table_name in (
-  'TB_ZONE0_EVENT_RAW','TB_ZONE1_TECHNICAL_LOG','TB_STOCK_FUNDAMENTAL','TB_ZONE3_PATTERN_LIBRARY','TB_ZONE4_MADNESS_LOG','TB_ZONE5_DECISION_LOG','TB_TRADE_HISTORY'
+  'TB_ZONE0_EVENT_RAW','TB_ZONE1_TECHNICAL_LOG','TB_ZONE2_FUNDAMENTAL','TB_ZONE3_PATTERN_LIBRARY','TB_ZONE4_MADNESS_LOG','TB_ZONE5_DECISION_LOG','TB_TRADE_HISTORY'
 ) order by table_name;
 prompt === INDEXES ===
 select index_name, table_name, locality from user_part_indexes where table_name in (

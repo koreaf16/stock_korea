@@ -132,10 +132,10 @@ end;
 declare
   v_count number := 0;
 begin
-  select count(*) into v_count from user_tables where table_name = 'TB_STOCK_FUNDAMENTAL';
+  select count(*) into v_count from user_tables where table_name = 'TB_ZONE2_FUNDAMENTAL';
   if v_count = 0 then
     execute immediate q'[
-      create table TB_STOCK_FUNDAMENTAL (
+      create table TB_ZONE2_FUNDAMENTAL (
         symbol                  varchar2(12) not null,
         risk_flag               varchar2(16) not null,
         issues_json             clob,
@@ -144,16 +144,59 @@ begin
         has_capital_impairment  number(1) default 0 not null,
         checked_at              timestamp(6) default systimestamp not null,
         source                  varchar2(20) default 'SYSTEM' not null,
-        constraint PK_TB_STOCK_FUNDAMENTAL primary key (symbol),
-        constraint CK_Z2_RISK_FLAG check (risk_flag in ('CLEAR', 'BLOCKED')),
-        constraint CK_Z2_CB_BW check (has_cb_bw_issue in (0, 1)),
-        constraint CK_Z2_KRX check (has_krx_warning in (0, 1)),
-        constraint CK_Z2_CAPITAL check (has_capital_impairment in (0, 1))
+        constraint PK_TB_ZONE2_FUNDAMENTAL primary key (symbol),
+        constraint CK_Z2_FUND_RISK_FLAG check (risk_flag in ('CLEAR', 'BLOCKED')),
+        constraint CK_Z2_FUND_CB_BW check (has_cb_bw_issue in (0, 1)),
+        constraint CK_Z2_FUND_KRX check (has_krx_warning in (0, 1)),
+        constraint CK_Z2_FUND_CAPITAL check (has_capital_impairment in (0, 1))
       )
     ]';
-    dbms_output.put_line('created table TB_STOCK_FUNDAMENTAL');
+    dbms_output.put_line('created table TB_ZONE2_FUNDAMENTAL');
   else
-    dbms_output.put_line('table TB_STOCK_FUNDAMENTAL already exists');
+    dbms_output.put_line('table TB_ZONE2_FUNDAMENTAL already exists');
+  end if;
+end;
+/
+
+declare
+  v_old_count number := 0;
+begin
+  select count(*) into v_old_count from user_tables where table_name = 'TB_STOCK_FUNDAMENTAL';
+  if v_old_count > 0 then
+    execute immediate q'[
+      merge into TB_ZONE2_FUNDAMENTAL tgt
+      using (
+        select
+          symbol,
+          risk_flag,
+          issues_json,
+          has_cb_bw_issue,
+          has_krx_warning,
+          has_capital_impairment,
+          checked_at,
+          source
+        from TB_STOCK_FUNDAMENTAL
+      ) src
+      on (tgt.symbol = src.symbol)
+      when matched then
+        update set
+          tgt.risk_flag = src.risk_flag,
+          tgt.issues_json = src.issues_json,
+          tgt.has_cb_bw_issue = src.has_cb_bw_issue,
+          tgt.has_krx_warning = src.has_krx_warning,
+          tgt.has_capital_impairment = src.has_capital_impairment,
+          tgt.checked_at = src.checked_at,
+          tgt.source = src.source
+      when not matched then
+        insert (
+          symbol, risk_flag, issues_json, has_cb_bw_issue, has_krx_warning, has_capital_impairment, checked_at, source
+        ) values (
+          src.symbol, src.risk_flag, src.issues_json, src.has_cb_bw_issue, src.has_krx_warning, src.has_capital_impairment, src.checked_at, src.source
+        )
+    ]';
+    dbms_output.put_line('migrated data TB_STOCK_FUNDAMENTAL -> TB_ZONE2_FUNDAMENTAL');
+  else
+    dbms_output.put_line('legacy table TB_STOCK_FUNDAMENTAL not found, migration skipped');
   end if;
 end;
 /
@@ -163,7 +206,7 @@ declare
 begin
   select count(*) into v_count from user_indexes where index_name = 'IX_Z2_FUND_CHECKED_AT';
   if v_count = 0 then
-    execute immediate 'create index IX_Z2_FUND_CHECKED_AT on TB_STOCK_FUNDAMENTAL(checked_at)';
+    execute immediate 'create index IX_Z2_FUND_CHECKED_AT on TB_ZONE2_FUNDAMENTAL(checked_at)';
     dbms_output.put_line('created index IX_Z2_FUND_CHECKED_AT');
   else
     dbms_output.put_line('index IX_Z2_FUND_CHECKED_AT already exists');

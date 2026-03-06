@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import io
 import json
 import math
 import os
@@ -9,11 +10,19 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-import FinanceDataReader as fdr
 import numpy as np
 import oracledb
 import pandas as pd
 import requests
+try:
+    import FinanceDataReader as fdr
+except ModuleNotFoundError:
+    fdr = None
+
+try:
+    from pykrx import stock as pykrx_stock
+except ModuleNotFoundError:
+    pykrx_stock = None
 
 
 ZONE3_VECTOR_DIM = max(128, int(os.getenv("ZONE3_VECTOR_DIM", "1024")))
@@ -107,7 +116,7 @@ class HttpClient:
                 )
                 time.sleep(wait)
 
-        raise RuntimeError(f"{retry_context} request failed: {url} ({last_exc})")
+        raise RuntimeError(f"{retry_context} request failed: {url} ({last_exc})") from last_exc
 
 
 class KisClient:
@@ -117,26 +126,34 @@ class KisClient:
         self.app_secret = os.getenv("KIS_APP_SECRET", "").strip()
         self.rest_url = os.getenv("KIS_REST_URL", "").strip().rstrip("/")
         self.enabled = bool(self.app_key and self.app_secret and self.rest_url)
+        self.disabled_reason: str | None = None
+        self._disable_emitted = False
         self._token: str | None = None
         self._token_expires = dt.datetime.now(dt.UTC)
 
     def _ensure_token(self) -> str:
         if not self.enabled:
-            raise RuntimeError("KIS env missing")
+            raise RuntimeError(self.disabled_reason or "KIS env missing")
         now = dt.datetime.now(dt.UTC)
         if self._token and now < self._token_expires - dt.timedelta(minutes=1):
             return self._token
 
-        data = self.http.request_json(
-            method="POST",
-            url=f"{self.rest_url}/oauth2/tokenP",
-            json_body={
-                "grant_type": "client_credentials",
-                "appkey": self.app_key,
-                "appsecret": self.app_secret,
-            },
-            retry_context="kis:token",
-        )
+        try:
+            data = self.http.request_json(
+                method="POST",
+                url=f"{self.rest_url}/oauth2/tokenP",
+                json_body={
+                    "grant_type": "client_credentials",
+                    "appkey": self.app_key,
+                    "appsecret": self.app_secret,
+                },
+                retry_context="kis:token",
+            )
+        except Exception as exc:
+            if is_kis_auth_forbidden_error(exc):
+                self.disable("KIS 토큰 인증 401/403: KIS_APP_KEY/KIS_APP_SECRET/KIS_REST_URL 조합 확인 필요")
+            raise
+
         token = str(data.get("access_token", "")).strip()
         if not token:
             raise RuntimeError("KIS token empty")
@@ -194,6 +211,8 @@ class KisClient:
                     )
             except Exception as exc:
                 emit("log", f"[KIS] daily failed symbol={symbol}: {exc}", level="warn")
+                if not self.enabled:
+                    break
             current = chunk_end + dt.timedelta(days=1)
 
         if not rows:
@@ -252,6 +271,26 @@ class KisClient:
         df = pd.DataFrame(rows)
         return preprocess_minute_df(df)
 
+    def disable(self, reason: str) -> None:
+        self.enabled = False
+        self.disabled_reason = reason
+        if not self._disable_emitted:
+            emit("log", f"[KIS] disabled: {reason}", level="warn")
+            self._disable_emitted = True
+
+
+def is_kis_auth_forbidden_error(exc: Exception) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, requests.HTTPError):
+            status_code = current.response.status_code if current.response is not None else None
+            if status_code in (401, 403):
+                return True
+        current = current.__cause__
+
+    message = str(exc)
+    return "401" in message or "403" in message
+
 
 def preprocess_minute_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -276,7 +315,7 @@ def to_float(value: Any) -> float:
 
 
 def get_market_symbols(exclude_keywords: list[str]) -> pd.DataFrame:
-    listing = fdr.StockListing("KRX")
+    listing = fetch_market_listing_df()
     if listing.empty:
         return listing
 
@@ -303,7 +342,103 @@ def get_market_symbols(exclude_keywords: list[str]) -> pd.DataFrame:
     return listing.reset_index(drop=True)
 
 
+def fetch_market_listing_df() -> pd.DataFrame:
+    if fdr is not None:
+        try:
+            listing = fdr.StockListing("KRX")
+            if listing is not None and not listing.empty:
+                return listing
+            emit("log", "[FDR] StockListing('KRX') empty, fallback to pykrx", level="warn")
+        except Exception as exc:
+            emit("log", f"[FDR] StockListing('KRX') failed: {exc}", level="warn")
+
+    if pykrx_stock is not None:
+        try:
+            listing = fetch_market_listing_with_pykrx()
+            if listing is not None and not listing.empty:
+                return listing
+            emit("log", "[PYKRX] listing empty", level="warn")
+        except Exception as exc:
+            emit("log", f"[PYKRX] listing failed: {exc}", level="warn")
+
+    try:
+        listing = fetch_market_listing_with_kind()
+        if listing is not None and not listing.empty:
+            return listing
+        emit("log", "[KIND] listing empty", level="warn")
+    except Exception as exc:
+        emit("log", f"[KIND] listing failed: {exc}", level="warn")
+
+    raise RuntimeError(
+        "종목 마스터 리스트 수집 실패(FDR/PYKRX/KIND). "
+        "네트워크/접속 제한 또는 데이터 소스 응답 상태를 확인하세요."
+    )
+
+
+def fetch_market_listing_with_pykrx() -> pd.DataFrame:
+    if pykrx_stock is None:
+        return pd.DataFrame()
+
+    for day_offset in range(0, 14):
+        rows: list[dict[str, str]] = []
+        ymd = (dt.date.today() - dt.timedelta(days=day_offset)).strftime("%Y%m%d")
+        for market in ("KOSPI", "KOSDAQ"):
+            tickers = pykrx_stock.get_market_ticker_list(date=ymd, market=market)
+            for symbol in tickers:
+                rows.append(
+                    {
+                        "Symbol": to_symbol(symbol),
+                        "Name": str(pykrx_stock.get_market_ticker_name(symbol) or ""),
+                        "Market": market,
+                    }
+                )
+        if rows:
+            emit("log", f"[PYKRX] listing date={ymd} rows={len(rows)}", level="info")
+            return pd.DataFrame(rows)
+
+    return pd.DataFrame()
+
+
+def fetch_market_listing_with_kind() -> pd.DataFrame:
+    market_map = {
+        "stockMkt": "KOSPI",
+        "kosdaqMkt": "KOSDAQ",
+    }
+    rows: list[dict[str, str]] = []
+    session = requests.Session()
+
+    for market_type, market_name in market_map.items():
+        url = f"https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&marketType={market_type}"
+        response = session.get(url, timeout=KIS_TIMEOUT_SEC, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+
+        tables = pd.read_html(io.StringIO(response.text))
+        if not tables:
+            continue
+        df = tables[0].copy()
+
+        symbol_col = "종목코드" if "종목코드" in df.columns else None
+        name_col = "회사명" if "회사명" in df.columns else None
+        if not symbol_col or not name_col:
+            continue
+
+        for _, row in df.iterrows():
+            rows.append(
+                {
+                    "Symbol": to_symbol(row.get(symbol_col)),
+                    "Name": str(row.get(name_col) or "").strip(),
+                    "Market": market_name,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
 def fetch_daily_df_with_fdr(symbol: str, start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
+    if fdr is None:
+        return fetch_daily_df_with_pykrx(symbol, start_date, end_date)
     try:
         time.sleep(REQUEST_DELAY_SEC)
         df = fdr.DataReader(symbol, start_date, end_date)
@@ -324,6 +459,45 @@ def fetch_daily_df_with_fdr(symbol: str, start_date: dt.date, end_date: dt.date)
         return df
     except Exception as exc:
         emit("log", f"[FDR] daily failed symbol={symbol}: {exc}", level="warn")
+        return pd.DataFrame()
+
+
+def fetch_daily_df_with_pykrx(symbol: str, start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
+    if pykrx_stock is None:
+        emit("log", f"[PYKRX] pykrx 모듈 없음 symbol={symbol}", level="warn")
+        return pd.DataFrame()
+    try:
+        time.sleep(REQUEST_DELAY_SEC)
+        df = pykrx_stock.get_market_ohlcv_by_date(
+            fromdate=start_date.strftime("%Y%m%d"),
+            todate=end_date.strftime("%Y%m%d"),
+            ticker=symbol,
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.reset_index()
+        df = df.rename(
+            columns={
+                "날짜": "Date",
+                "시가": "Open",
+                "고가": "High",
+                "저가": "Low",
+                "종가": "Close",
+                "거래량": "Volume",
+            }
+        )
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+        df = df.dropna(subset=["Date"])
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        for col in required:
+            if col not in df.columns:
+                df[col] = 0.0
+        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        df = df.sort_values("Date")
+        df = df.drop_duplicates(subset=["Date"], keep="first")
+        return df
+    except Exception as exc:
+        emit("log", f"[PYKRX] daily failed symbol={symbol}: {exc}", level="warn")
         return pd.DataFrame()
 
 
@@ -501,7 +675,7 @@ def run() -> None:
     exclude_keywords = [token.strip() for token in str(args.exclude_keywords).split(",") if token.strip()]
     listing = get_market_symbols(exclude_keywords=exclude_keywords)
     if listing.empty:
-        raise RuntimeError("종목 마스터 리스트 수집 실패(FinanceDataReader)")
+        raise RuntimeError("종목 마스터 리스트 수집 실패(FDR/PYKRX)")
     try:
         existing_symbols = fetch_existing_symbols_from_db()
     except Exception as exc:
@@ -566,12 +740,14 @@ def run() -> None:
         # 이벤트 과다 시 상위 변동폭부터 처리
         events = sorted(events, key=lambda e: abs(e.pct_change), reverse=True)[: max(1, args.max_events_per_symbol)]
 
+        if not kis.enabled:
+            emit("log", f"[{symbol}] KIS 비활성화로 분봉 수집 불가, 이벤트 {len(events)}건 skip", level="warn")
+            progress = int((idx / max(1, total)) * 100)
+            emit("progress", f"{symbol} 처리 완료", progress=progress, processed_symbols=processed_symbols, records=len(records))
+            continue
+
         # 2단계: 이벤트일 분봉 핀셋 수집 후 벡터화
         for event in events:
-            if not kis.enabled:
-                emit("log", f"[{symbol}] KIS 비활성화로 분봉 수집 불가, skip", level="warn")
-                continue
-
             minute_df = kis.fetch_event_day_minutes(symbol, event.event_date)
             if minute_df.empty:
                 emit("log", f"[{symbol}] {event.event_date} 분봉 없음, skip", level="warn")

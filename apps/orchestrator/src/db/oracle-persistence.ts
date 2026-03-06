@@ -309,7 +309,7 @@ export function createOraclePersistence(): OraclePersistence {
       await withConnection(async (connection) => {
         await connection.execute(
           `
-            merge into TB_STOCK_FUNDAMENTAL tgt
+            merge into TB_ZONE2_FUNDAMENTAL tgt
             using (
               select
                 :symbol as symbol,
