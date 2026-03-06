@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,7 @@ UPSERT_BATCH_SIZE = max(1, int(os.getenv("ZONE3_UPSERT_BATCH_SIZE", "100")))
 RAW_BASE_DIR = Path(os.getenv("ZONE3_RAW_BASE_DIR", "data/zone3/raw"))
 RAW_DAILY_DIR = RAW_BASE_DIR / "daily"
 RAW_MINUTE_DIR = RAW_BASE_DIR / "minute"
+TOKEN_THROTTLE_WAIT_SEC = max(10, int(os.getenv("KIS_TOKEN_THROTTLE_WAIT_SEC", "60")))
 
 
 @dataclass(frozen=True)
@@ -180,8 +182,16 @@ def emit(event_type: str, message: str, **extra: Any) -> None:
 
 
 def to_symbol(raw: Any) -> str:
-    digits = "".join(ch for ch in str(raw or "").strip() if ch.isdigit())
-    return digits[:6].zfill(6) if digits else ""
+    text = str(raw or "").strip().upper()
+    if not text:
+        return ""
+    if re.fullmatch(r"[A-Z0-9]{6}", text):
+        return text
+    # Some providers prepend market prefix like A005930.
+    if re.fullmatch(r"[A-Z][A-Z0-9]{6}", text):
+        return text[1:]
+    # Reject unsupported symbol formats.
+    return ""
 
 
 def ensure_raw_dirs() -> None:
@@ -321,6 +331,7 @@ class KisClient:
         self._disable_emitted = False
         self._token: str | None = None
         self._token_expires = dt.datetime.now(dt.UTC)
+        self._token_retry_not_before: dt.datetime | None = None
 
     def _ensure_token(self) -> str:
         if not self.enabled:
@@ -329,22 +340,41 @@ class KisClient:
         if self._token and now < self._token_expires - dt.timedelta(minutes=1):
             return self._token
 
-        try:
-            data = self.http.request_json(
-                method="POST",
-                url=f"{self.rest_url}/oauth2/tokenP",
-                json_body={
-                    "grant_type": "client_credentials",
-                    "appkey": self.app_key,
-                    "appsecret": self.app_secret,
-                },
-                retry_context="kis:token",
-            )
-        except Exception as exc:
-            if is_kis_auth_forbidden_error(exc):
-                self.disable("KIS 토큰 인증 401/403: KIS_APP_KEY/KIS_APP_SECRET/KIS_REST_URL 조합 확인 필요")
-            raise
+        if self._token_retry_not_before and now < self._token_retry_not_before:
+            wait_sec = max(1.0, (self._token_retry_not_before - now).total_seconds())
+            emit("log", f"[KIS] token throttle cooldown wait={wait_sec:.1f}s", level="warn")
+            time.sleep(wait_sec)
+            now = dt.datetime.now(dt.UTC)
 
+        data: dict[str, Any] | None = None
+        for attempt in range(1, 3):
+            try:
+                data = self.http.request_json(
+                    method="POST",
+                    url=f"{self.rest_url}/oauth2/tokenP",
+                    json_body={
+                        "grant_type": "client_credentials",
+                        "appkey": self.app_key,
+                        "appsecret": self.app_secret,
+                    },
+                    retry_context="kis:token",
+                )
+                self._token_retry_not_before = None
+                break
+            except Exception as exc:
+                if is_kis_token_throttle_error(exc):
+                    if attempt >= 2:
+                        raise RuntimeError("KIS 토큰 발급 제한(EGW00133): 잠시 후 재시도 필요") from exc
+                    self._token_retry_not_before = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=TOKEN_THROTTLE_WAIT_SEC)
+                    emit("log", f"[KIS] token throttle 감지, {TOKEN_THROTTLE_WAIT_SEC}초 대기 후 재시도", level="warn")
+                    time.sleep(TOKEN_THROTTLE_WAIT_SEC)
+                    continue
+                if is_kis_auth_forbidden_error(exc):
+                    self.disable("KIS 토큰 인증 401/403: KIS_APP_KEY/KIS_APP_SECRET/KIS_REST_URL 조합 확인 필요")
+                raise
+
+        if not data:
+            raise RuntimeError("KIS token response empty")
         token = str(data.get("access_token", "")).strip()
         if not token:
             raise RuntimeError("KIS token empty")
@@ -475,12 +505,31 @@ def is_kis_auth_forbidden_error(exc: Exception) -> bool:
     while current is not None:
         if isinstance(current, requests.HTTPError):
             status_code = current.response.status_code if current.response is not None else None
-            if status_code in (401, 403):
+            if status_code == 401:
+                return True
+            if status_code == 403 and current.response is not None:
+                body = current.response.text or ""
+                if "EGW00133" in body or "1분당 1회" in body:
+                    return False
                 return True
         current = current.__cause__
 
     message = str(exc)
+    if "EGW00133" in message or "1분당 1회" in message:
+        return False
     return "401" in message or "403" in message
+
+
+def is_kis_token_throttle_error(exc: Exception) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, requests.HTTPError) and current.response is not None:
+            body = current.response.text or ""
+            if "EGW00133" in body or "1분당 1회" in body or "잠시 후 다시 시도" in body:
+                return True
+        current = current.__cause__
+    message = str(exc)
+    return "EGW00133" in message or "1분당 1회" in message or "잠시 후 다시 시도" in message
 
 
 def preprocess_minute_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -515,7 +564,7 @@ def get_market_symbols(exclude_keywords: list[str]) -> pd.DataFrame:
         listing["Symbol"] = listing["Symbol"].map(to_symbol)
     else:
         listing["Symbol"] = ""
-    listing = listing[listing["Symbol"].str.match(r"^\d{6}$", na=False)]
+    listing = listing[listing["Symbol"].str.match(r"^[A-Z0-9]{6}$", na=False)]
 
     if "Market" in listing.columns:
         listing = listing[listing["Market"].isin(["KOSPI", "KOSDAQ"])]
