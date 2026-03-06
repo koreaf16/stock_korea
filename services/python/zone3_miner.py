@@ -8,6 +8,7 @@ import math
 import os
 import re
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -22,6 +23,11 @@ except ModuleNotFoundError:
     fdr = None
 
 try:
+    warnings.filterwarnings(
+        "ignore",
+        message=".*pkg_resources is deprecated as an API.*",
+        category=UserWarning,
+    )
     from pykrx import stock as pykrx_stock
 except ModuleNotFoundError:
     pykrx_stock = None
@@ -37,6 +43,7 @@ EVENT_UP_PCT = 15.0
 EVENT_DOWN_PCT = -10.0
 WINDOW_MINUTES = 30
 UPSERT_BATCH_SIZE = max(1, int(os.getenv("ZONE3_UPSERT_BATCH_SIZE", "100")))
+LOOKBACK_DAYS = max(30, int(os.getenv("ZONE3_LOOKBACK_DAYS", "365")))
 RAW_BASE_DIR = Path(os.getenv("ZONE3_RAW_BASE_DIR", "data/zone3/raw"))
 RAW_DAILY_DIR = RAW_BASE_DIR / "daily"
 RAW_MINUTE_DIR = RAW_BASE_DIR / "minute"
@@ -903,6 +910,7 @@ def iter_symbols(listing_df: pd.DataFrame, limit: int) -> Iterable[tuple[int, in
 def load_or_fetch_daily(symbol: str, start_date: dt.date, end_date: dt.date, kis: KisClient) -> pd.DataFrame:
     cached = load_daily_raw(symbol)
     if not cached.empty:
+        # 로컬 CSV 캐시가 이미 존재하면 전기간 데이터를 그대로 활용한다.
         return cached
 
     if kis.enabled:
@@ -1102,7 +1110,7 @@ def run() -> None:
     ensure_raw_dirs()
 
     today = dt.date.today()
-    start_date = today - dt.timedelta(days=365 * 2)
+    start_date = today - dt.timedelta(days=LOOKBACK_DAYS)
     end_date = today
 
     exclude_keywords = [token.strip() for token in str(args.exclude_keywords).split(",") if token.strip()]
@@ -1141,6 +1149,7 @@ def run() -> None:
         symbols_total=min(args.symbol_limit, len(listing)),
         resume_skip_symbols=len(existing_symbols),
         raw_base_dir=str(RAW_BASE_DIR.resolve()),
+        lookback_days=LOOKBACK_DAYS,
         upsert_batch_size=UPSERT_BATCH_SIZE,
         kis_enabled=kis.enabled,
     )

@@ -7,4 +7,5 @@ coverage/
 *.log
 __pycache__/
 *.pyc
-
+data/zone3/
+apps/orchestrator/data/zone3/

@@ -52,6 +52,7 @@ interface OracleEnv {
 }
 
 const ZONE3_REQUIRED_PYTHON_MODULES = ["numpy", "oracledb", "pandas", "requests"] as const;
+const ZONE3_LOOKBACK_DAYS = Math.max(30, Number(process.env.ZONE3_LOOKBACK_DAYS ?? 365));
 
 export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent) => void): Zone3MinerManager {
   let state: Zone3MiningState = {
@@ -131,7 +132,7 @@ export function createZone3MinerManager(onEvent: (event: Zone3MiningSocketEvent)
 
     emit({
       type: "status",
-      message: `Zone3 마이닝 시작 (Auto: 최근 2년/자동 이어하기, cmd=${pythonCmd})`,
+      message: `Zone3 마이닝 시작 (Auto: 최근 ${ZONE3_LOOKBACK_DAYS}일/자동 이어하기, cmd=${pythonCmd})`,
       running: true,
       progress: 0
     });
