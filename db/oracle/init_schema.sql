@@ -50,6 +50,43 @@ end;
 declare
   v_count number := 0;
 begin
+  select count(*) into v_count from user_tables where table_name = 'TB_ZONE0_TG_CHANNELS';
+  if v_count = 0 then
+    execute immediate q'[
+      create table TB_ZONE0_TG_CHANNELS (
+        CHANNEL_ID         varchar2(64) not null,
+        CHANNEL_USERNAME   varchar2(128) not null,
+        CHANNEL_NAME       varchar2(256) not null,
+        IS_ACTIVE          number(1) default 1 not null,
+        CREATED_AT         timestamp(6) default systimestamp not null,
+        UPDATED_AT         timestamp(6) default systimestamp not null,
+        constraint PK_TB_ZONE0_TG_CHANNELS primary key (CHANNEL_ID),
+        constraint CK_Z0_TG_ACTIVE check (IS_ACTIVE in (0, 1))
+      )
+    ]';
+    dbms_output.put_line('created table TB_ZONE0_TG_CHANNELS');
+  else
+    dbms_output.put_line('table TB_ZONE0_TG_CHANNELS already exists');
+  end if;
+end;
+/
+
+declare
+  v_count number := 0;
+begin
+  select count(*) into v_count from user_indexes where index_name = 'IX_Z0_TG_USERNAME';
+  if v_count = 0 then
+    execute immediate 'create unique index IX_Z0_TG_USERNAME on TB_ZONE0_TG_CHANNELS(CHANNEL_USERNAME)';
+    dbms_output.put_line('created index IX_Z0_TG_USERNAME');
+  else
+    dbms_output.put_line('index IX_Z0_TG_USERNAME already exists');
+  end if;
+end;
+/
+
+declare
+  v_count number := 0;
+begin
   select count(*) into v_count from user_tables where table_name = 'TB_ZONE1_TECHNICAL_LOG';
   if v_count = 0 then
     execute immediate q'[

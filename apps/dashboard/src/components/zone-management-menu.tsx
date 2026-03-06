@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 
 import { decisionActionKo, madnessStageKo, patternClassKo, sourceKo } from "@/lib/korean";
 import type { OrchestratorHealth } from "@/lib/orchestrator-health";
@@ -47,6 +48,16 @@ const ZONE_ENDPOINT: Record<ZoneKey, string> = {
   zone4: "/api/zone4/state",
   zone5: "/api/zone5/state",
   zone6: "/api/zone6/state"
+};
+
+const ZONE_ROUTE_ID: Record<ZoneKey, string> = {
+  zone0: "0",
+  zone1: "1",
+  zone2: "2",
+  zone3: "3",
+  zone4: "4",
+  zone5: "5",
+  zone6: "6"
 };
 
 function createInitialZoneStates(): Record<ZoneKey, ZonePayloadState> {
@@ -208,6 +219,9 @@ function healthSummary(zone: ZoneKey, health: OrchestratorHealth | null): ZonePr
       { label: "틱 버퍼", value: `${health.zone0.ticksBuffered.toLocaleString("ko-KR")}개` },
       { label: "뉴스 버퍼", value: `${health.zone0.newsBuffered.toLocaleString("ko-KR")}개` },
       { label: "종토방 버퍼", value: `${health.zone0.boardBuffered.toLocaleString("ko-KR")}개` },
+      { label: "DART 버퍼", value: `${health.zone0.dartBuffered.toLocaleString("ko-KR")}개` },
+      { label: "수급 버퍼", value: `${health.zone0.fundamentalBuffered.toLocaleString("ko-KR")}개` },
+      { label: "거시 버퍼", value: `${health.zone0.macroBuffered.toLocaleString("ko-KR")}개` },
       { label: "텔레그램 버퍼", value: `${health.zone0.telegramBuffered.toLocaleString("ko-KR")}개` },
       { label: "최근 프레임", value: dateTimeText(health.zone0.lastFrameAt) }
     ];
@@ -410,6 +424,12 @@ export function ZoneManagementMenu({ health }: ZoneManagementMenuProps) {
                 >
                   API 열기
                 </a>
+                <Link
+                  href={`/zone/${ZONE_ROUTE_ID[activeZone]}`}
+                  className="rounded-md border border-cyan-500/50 bg-cyan-500/10 px-2 py-1 text-xs text-cyan-200 hover:bg-cyan-500/20"
+                >
+                  상세 페이지
+                </Link>
                 <span className="text-[11px] text-slate-400">
                   최근 조회 {currentState.fetchedAt ? dateTimeText(currentState.fetchedAt) : "-"}
                 </span>
@@ -443,4 +463,3 @@ export function ZoneManagementMenu({ health }: ZoneManagementMenuProps) {
     </Panel>
   );
 }
-

@@ -169,11 +169,10 @@ function evaluateWithLocalVector(
   records: Zone6MemoryRecord[],
   minSimilarity: number
 ): Zone6EngineResult {
-  const baseline = buildBaselineFeedback(symbol, pattern, madness);
   if (records.length === 0) {
     return {
       source: "LOCAL_VECTOR",
-      output: baseline
+      output: buildNoHistoryFeedback("실거래 이력 없음")
     };
   }
 
@@ -189,7 +188,7 @@ function evaluateWithLocalVector(
   if (topCandidates.length === 0) {
     return {
       source: "LOCAL_VECTOR",
-      output: baseline
+      output: buildNoHistoryFeedbackFromRecords(records, "유사 이력 임계치 미달")
     };
   }
 
@@ -197,7 +196,7 @@ function evaluateWithLocalVector(
   if (weightSum <= 0) {
     return {
       source: "LOCAL_VECTOR",
-      output: baseline
+      output: buildNoHistoryFeedbackFromRecords(records, "유사 이력 가중치 부족")
     };
   }
 
@@ -208,13 +207,13 @@ function evaluateWithLocalVector(
   const weightedWinRate = weightedWins / weightSum;
   const avgPnl =
     topCandidates.reduce((acc, candidate) => acc + candidate.record.realizedPnlPct, 0) / Math.max(1, topCandidates.length);
-  const winRate = clamp(weightedWinRate * 0.75 + baseline.winRate * 0.25, 0.1, 0.9);
+  const winRate = clamp(weightedWinRate, 0, 1);
 
   const best = topCandidates[0];
   if (!best) {
     return {
       source: "LOCAL_VECTOR",
-      output: baseline
+      output: buildNoHistoryFeedbackFromRecords(records, "유사 이력 없음")
     };
   }
 
@@ -268,24 +267,26 @@ function evaluateWithPython(pattern: Zone3PatternMatch, madness: Zone4Madness): 
   };
 }
 
-function buildBaselineFeedback(symbol: string, pattern: Zone3PatternMatch, madness: Zone4Madness): Zone6HistoryFeedback {
-  const baseWinRate = pattern.klass === "CLASS_A" ? 0.62 : pattern.klass === "CLASS_C" ? 0.38 : 0.5;
-  const stagePenalty = madness.stage === "STAGE_3" ? -0.08 : madness.stage === "STAGE_2" ? 0.03 : 0;
-  const similarityBoost = (pattern.similarity - 0.5) * 0.22;
-  const winRate = clamp(baseWinRate + stagePenalty + similarityBoost, 0.1, 0.9);
-  const key = hashToken(`${symbol}:${pattern.klass}:${madness.stage}`).toString(36).slice(0, 6).toUpperCase();
-
-  const summary =
-    pattern.klass === "CLASS_A"
-      ? "과거 급등 유사 패턴 우위. 과열 전환(STAGE_3) 시 추격 매수는 축소 권장."
-      : pattern.klass === "CLASS_C"
-        ? "과거 급락 유사 패턴 우세. 반등 확인 전 보수적 접근 권장."
-        : "뚜렷한 우위 패턴 없음. 거래대금/호가 균형 재확인 필요.";
-
+function buildNoHistoryFeedback(summary: string): Zone6HistoryFeedback {
   return {
-    similarTradeId: `HIST_BASE_${key}`,
-    winRate: Number(winRate.toFixed(2)),
+    similarTradeId: "HIST_NONE",
+    winRate: 0,
     summary,
+    updatedAt: nowIso()
+  };
+}
+
+function buildNoHistoryFeedbackFromRecords(records: Zone6MemoryRecord[], reason: string): Zone6HistoryFeedback {
+  if (records.length === 0) {
+    return buildNoHistoryFeedback(reason);
+  }
+
+  const wins = records.reduce((acc, record) => acc + (record.isWin ? 1 : 0), 0);
+  const winRate = wins / records.length;
+  return {
+    similarTradeId: "HIST_NONE",
+    winRate: Number(clamp(winRate, 0, 1).toFixed(2)),
+    summary: `${reason}. 누적 이력 ${records.length}건 기준 승률 ${Number((winRate * 100).toFixed(1))}%.`,
     updatedAt: nowIso()
   };
 }

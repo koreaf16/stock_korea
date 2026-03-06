@@ -15,42 +15,58 @@ export function initRuntime(): RuntimeState {
 }
 
 export async function stepRuntime(prev: RuntimeState): Promise<RuntimeState> {
-  const tickCount = prev.tickCount + 1;
   const prevSnapshot = prev.snapshot;
 
-  const zone0Frame = prev.zone0.nextFrame({
-    targetSymbol: prevSnapshot.targetSymbol,
-    previousTick: prevSnapshot.tick
-  });
+  const zone0Frame = prev.zone0.consumeFrame();
+  if (!zone0Frame) {
+    return prev;
+  }
+
+  const tickCount = prev.tickCount + 1;
   const tick = zone0Frame.tick;
+  const symbol = tick.symbol || prevSnapshot.targetSymbol;
+  const latestMarketFlow = zone0Frame.fundamentalData[zone0Frame.fundamentalData.length - 1] ?? null;
+  const nextGlobalContext = zone0Frame.globalContext ?? prevSnapshot.globalContext;
   const technical = prev.zone1.nextTechnical({
     tick,
     orderBook: zone0Frame.orderBook
   });
   const fundamental = prev.zone2.evaluate({
-    symbol: prevSnapshot.targetSymbol,
+    symbol,
     previous: prevSnapshot.fundamental,
-    tickCount
+    tickCount,
+    zone0Fundamental: latestMarketFlow
+      ? {
+          symbol: latestMarketFlow.symbol,
+          foreignNetBuyQty: latestMarketFlow.foreignNetBuyQty,
+          institutionalNetBuyQty: latestMarketFlow.institutionalNetBuyQty,
+          shortBalanceQty: latestMarketFlow.shortBalanceQty,
+          source: latestMarketFlow.source,
+          timestamp: latestMarketFlow.timestamp
+        }
+      : null
   });
   const pattern = prev.zone3.evaluate({
-    symbol: prevSnapshot.targetSymbol,
+    symbol,
     tick,
     technical
   });
   const madness = prev.zone4.evaluate({
-    symbol: prevSnapshot.targetSymbol,
+    symbol,
     technical,
     pattern,
     sentimentPulse: zone0Frame.sentimentPulse
   });
   const history = prev.zone6.evaluate({
-    symbol: prevSnapshot.targetSymbol,
+    symbol,
     pattern,
     madness
   });
 
   const skeleton: DashboardSnapshot = {
     ...prevSnapshot,
+    targetSymbol: symbol,
+    globalContext: nextGlobalContext,
     tick,
     technical,
     fundamental,

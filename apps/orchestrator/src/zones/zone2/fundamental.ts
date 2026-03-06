@@ -6,8 +6,8 @@ import type { Zone2Fundamental } from "@stock/contracts";
 
 import { nowIso } from "../../utils.js";
 
-type Zone2Provider = "AUTO" | "PYTHON" | "MOCK";
-type Zone2Source = "PYTHON" | "MOCK";
+type Zone2Provider = "AUTO" | "PYTHON";
+type Zone2Source = "PYTHON" | "NO_DATA";
 
 interface Zone2WorkerResult {
   symbol: string;
@@ -23,6 +23,15 @@ interface Zone2ChecklistFlags {
   hasCbBwIssue: boolean;
   hasKrxWarning: boolean;
   hasCapitalImpairment: boolean;
+}
+
+export interface Zone0MarketFlowInput {
+  symbol: string;
+  foreignNetBuyQty: number;
+  institutionalNetBuyQty: number;
+  shortBalanceQty: number;
+  source: "KOSCOM" | "KRX";
+  timestamp: string;
 }
 
 interface Zone2CacheEntry {
@@ -44,7 +53,12 @@ export interface Zone2StateSnapshot {
 }
 
 export interface Zone2Engine {
-  evaluate: (input: { symbol: string; previous: Zone2Fundamental; tickCount: number }) => Zone2Fundamental;
+  evaluate: (input: {
+    symbol: string;
+    previous: Zone2Fundamental;
+    tickCount: number;
+    zone0Fundamental?: Zone0MarketFlowInput | null;
+  }) => Zone2Fundamental;
   getStateSnapshot: () => Zone2StateSnapshot;
 }
 
@@ -54,29 +68,53 @@ export function createZone2Engine(): Zone2Engine {
   const staleSeconds = Math.max(30, Number(process.env.ZONE2_STALE_SECONDS ?? 180));
   const staleMs = staleSeconds * 1_000;
   const forceBlockedSymbols = parseSymbolList(process.env.ZONE2_FORCE_BLOCKED_SYMBOLS);
+  const foreignNetSellBlockThreshold = Math.min(-1, Number(process.env.ZONE2_FOREIGN_NET_SELL_BLOCK_THRESHOLD ?? -200_000));
+  const institutionNetSellBlockThreshold = Math.min(
+    -1,
+    Number(process.env.ZONE2_INSTITUTION_NET_SELL_BLOCK_THRESHOLD ?? -180_000)
+  );
+  const shortBalanceBlockThreshold = Math.max(1, Number(process.env.ZONE2_SHORT_BALANCE_BLOCK_THRESHOLD ?? 500_000));
 
   const cache = new Map<string, Zone2CacheEntry>();
   let lastCheckedAt: string | null = null;
   let lastSource: Zone2Source | "NONE" = "NONE";
 
-  function evaluate(input: { symbol: string; previous: Zone2Fundamental; tickCount: number }): Zone2Fundamental {
+  function evaluate(input: {
+    symbol: string;
+    previous: Zone2Fundamental;
+    tickCount: number;
+    zone0Fundamental?: Zone0MarketFlowInput | null;
+  }): Zone2Fundamental {
     const symbol = input.symbol.trim();
     const nowMs = Date.now();
     const cached = cache.get(symbol);
+    const marketFlow = normalizeMarketFlowInput(input.zone0Fundamental, symbol);
+    const cacheExpired = cached ? isExpired(cached, input.tickCount, nowMs, refreshTicks, staleMs) : true;
 
-    if (cached && !isExpired(cached, input.tickCount, nowMs, refreshTicks, staleMs)) {
+    if (cached && !cacheExpired && !marketFlow) {
       return cached.value;
     }
 
     let nextEntry: Zone2CacheEntry | null = null;
 
-    if (provider === "PYTHON" || provider === "AUTO") {
+    if (cached && !cacheExpired) {
+      nextEntry = cached;
+    } else {
       nextEntry = evaluateFromPython(symbol, input.tickCount);
     }
 
     if (!nextEntry) {
-      nextEntry = evaluateFromMock(symbol, input.tickCount, forceBlockedSymbols);
+      nextEntry = buildNoDataEntry(symbol, input.tickCount);
     }
+
+    if (marketFlow) {
+      nextEntry = applyMarketFlowOverlay(nextEntry, marketFlow, input.tickCount, {
+        foreignNetSellBlockThreshold,
+        institutionNetSellBlockThreshold,
+        shortBalanceBlockThreshold
+      });
+    }
+    nextEntry = applyForceBlockOverlay(nextEntry, forceBlockedSymbols, input.tickCount);
 
     cache.set(symbol, nextEntry);
     lastCheckedAt = nextEntry.value.checkedAt;
@@ -94,7 +132,7 @@ export function createZone2Engine(): Zone2Engine {
       staleSeconds,
       cacheSize: cache.size,
       lastCheckedAt,
-      pythonEnabled: provider !== "MOCK"
+      pythonEnabled: true
     })
   };
 }
@@ -148,61 +186,25 @@ function evaluateFromPython(symbol: string, tickCount: number): Zone2CacheEntry 
   };
 }
 
-function evaluateFromMock(symbol: string, tickCount: number, forceBlockedSymbols: Set<string>): Zone2CacheEntry {
-  const checklist = deriveChecklistFromSymbol(symbol, forceBlockedSymbols);
-  const issues: string[] = [];
-
-  if (checklist.hasCbBwIssue) {
-    issues.push("최근 3개월 내 CB/BW/유상증자 이력");
-  }
-  if (checklist.hasKrxWarning) {
-    issues.push("KRX 투자경고/투자위험/관리종목 지정");
-  }
-  if (checklist.hasCapitalImpairment) {
-    issues.push("완전자본잠식 또는 재무 불건전성 신호");
-  }
-
-  const riskFlag = issues.length > 0 ? "BLOCKED" : "CLEAR";
+function buildNoDataEntry(symbol: string, tickCount: number): Zone2CacheEntry {
   const checkedAt = nowIso();
 
   return {
     value: {
       symbol,
-      riskFlag,
-      issues,
+      riskFlag: "BLOCKED",
+      issues: ["Zone2 실데이터 미수신"],
       checkedAt
     },
     checkedAtMs: Date.parse(checkedAt) || Date.now(),
     tickCount,
-    source: "MOCK",
-    checklist
+    source: "NO_DATA",
+    checklist: {
+      hasCbBwIssue: false,
+      hasKrxWarning: false,
+      hasCapitalImpairment: false
+    }
   };
-}
-
-function deriveChecklistFromSymbol(symbol: string, forceBlockedSymbols: Set<string>): Zone2ChecklistFlags {
-  if (forceBlockedSymbols.has(symbol)) {
-    return {
-      hasCbBwIssue: true,
-      hasKrxWarning: true,
-      hasCapitalImpairment: true
-    };
-  }
-
-  const hash = hashSymbol(symbol);
-
-  return {
-    hasCbBwIssue: hash % 23 === 0,
-    hasKrxWarning: hash % 29 === 0,
-    hasCapitalImpairment: hash % 31 === 0
-  };
-}
-
-function hashSymbol(symbol: string): number {
-  let hash = 7;
-  for (const ch of symbol) {
-    hash = (hash * 31 + ch.charCodeAt(0)) % 1_000_003;
-  }
-  return hash;
 }
 
 function resolveZone2WorkerPath(): string | null {
@@ -230,12 +232,109 @@ function isExpired(
   return tickCount - entry.tickCount >= refreshTicks || nowMs - entry.checkedAtMs >= staleMs;
 }
 
+function normalizeMarketFlowInput(raw: Zone0MarketFlowInput | null | undefined, symbol: string): Zone0MarketFlowInput | null {
+  if (!raw) {
+    return null;
+  }
+
+  if (String(raw.symbol ?? "").trim() !== symbol) {
+    return null;
+  }
+
+  if (!Number.isFinite(raw.foreignNetBuyQty) || !Number.isFinite(raw.institutionalNetBuyQty) || !Number.isFinite(raw.shortBalanceQty)) {
+    return null;
+  }
+
+  return {
+    symbol,
+    foreignNetBuyQty: Number(raw.foreignNetBuyQty),
+    institutionalNetBuyQty: Number(raw.institutionalNetBuyQty),
+    shortBalanceQty: Number(raw.shortBalanceQty),
+    source: raw.source,
+    timestamp: raw.timestamp || nowIso()
+  };
+}
+
+interface MarketFlowThresholds {
+  foreignNetSellBlockThreshold: number;
+  institutionNetSellBlockThreshold: number;
+  shortBalanceBlockThreshold: number;
+}
+
+function applyMarketFlowOverlay(
+  baseEntry: Zone2CacheEntry,
+  marketFlow: Zone0MarketFlowInput,
+  tickCount: number,
+  thresholds: MarketFlowThresholds
+): Zone2CacheEntry {
+  const issues = new Set(stripPreviousMarketFlowIssues(baseEntry.value.issues));
+
+  if (marketFlow.foreignNetBuyQty <= thresholds.foreignNetSellBlockThreshold) {
+    issues.add(`외국인 순매수 급감(${marketFlow.foreignNetBuyQty.toLocaleString("ko-KR")})`);
+  }
+  if (marketFlow.institutionalNetBuyQty <= thresholds.institutionNetSellBlockThreshold) {
+    issues.add(`기관 순매수 급감(${marketFlow.institutionalNetBuyQty.toLocaleString("ko-KR")})`);
+  }
+  if (marketFlow.shortBalanceQty >= thresholds.shortBalanceBlockThreshold) {
+    issues.add(`공매도 잔고 고위험(${marketFlow.shortBalanceQty.toLocaleString("ko-KR")})`);
+  }
+
+  const nextIssues = [...issues];
+  const riskFlag = nextIssues.length > 0 ? "BLOCKED" : baseEntry.value.riskFlag;
+  const checkedAt = marketFlow.timestamp || nowIso();
+
+  return {
+    value: {
+      symbol: baseEntry.value.symbol,
+      riskFlag,
+      issues: nextIssues,
+      checkedAt
+    },
+    checkedAtMs: Date.parse(checkedAt) || Date.now(),
+    tickCount,
+    source: baseEntry.source,
+    checklist: baseEntry.checklist
+  };
+}
+
+function applyForceBlockOverlay(baseEntry: Zone2CacheEntry, forceBlockedSymbols: Set<string>, tickCount: number): Zone2CacheEntry {
+  if (!forceBlockedSymbols.has(baseEntry.value.symbol)) {
+    return baseEntry;
+  }
+
+  const issues = new Set(baseEntry.value.issues);
+  issues.add("forced_blocked_symbol");
+  const checkedAt = nowIso();
+
+  return {
+    value: {
+      symbol: baseEntry.value.symbol,
+      riskFlag: "BLOCKED",
+      issues: [...issues],
+      checkedAt
+    },
+    checkedAtMs: Date.parse(checkedAt) || Date.now(),
+    tickCount,
+    source: baseEntry.source,
+    checklist: baseEntry.checklist
+  };
+}
+
+function stripPreviousMarketFlowIssues(issues: string[]): string[] {
+  return issues.filter(
+    (issue) =>
+      !issue.startsWith("외국인 순매수 급감(") &&
+      !issue.startsWith("기관 순매수 급감(") &&
+      !issue.startsWith("공매도 잔고 고위험(")
+  );
+}
+
 function normalizeProvider(raw?: string): Zone2Provider {
   const normalized = String(raw ?? "AUTO")
     .trim()
     .toUpperCase();
 
-  if (normalized === "PYTHON" || normalized === "MOCK") {
+  if (normalized === "PYTHON") {
     return normalized;
   }
 

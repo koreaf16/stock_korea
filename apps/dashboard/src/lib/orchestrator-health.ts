@@ -5,6 +5,9 @@ export interface OrchestratorHealth {
     ticksBuffered: number;
     newsBuffered: number;
     boardBuffered: number;
+    dartBuffered: number;
+    fundamentalBuffered: number;
+    macroBuffered: number;
     telegramBuffered: number;
     lastFrameAt: string | null;
   };

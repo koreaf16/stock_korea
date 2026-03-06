@@ -114,8 +114,8 @@ function evaluateWithLocalVector(
       source: "LOCAL_VECTOR",
       output: {
         klass: "CLASS_B",
-        similarity: 0.5,
-        matchedPatternId: "PATTERN_WARMUP",
+        similarity: 0,
+        matchedPatternId: "NO_DATA",
         updatedAt: now
       }
     };

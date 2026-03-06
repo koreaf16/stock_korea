@@ -84,6 +84,7 @@ export function sourceKo(value: string | null | undefined): string {
   if (!value) return "-";
   const upper = value.toUpperCase();
   if (upper === "PYTHON") return "파이썬";
+  if (upper === "NO_DATA") return "실데이터없음";
   if (upper === "MOCK") return "모의";
   if (upper === "AUTO") return "자동";
   if (upper === "LOCAL") return "로컬";

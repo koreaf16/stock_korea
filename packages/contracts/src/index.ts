@@ -81,6 +81,14 @@ export interface Zone2Fundamental {
   checkedAt: string;
 }
 
+export interface GlobalMacroContext {
+  usdKrw: number;
+  us10yYield: number;
+  updatedAt: string;
+  usdKrwSource: string;
+  us10ySource: string;
+}
+
 export type PatternClass = "CLASS_A" | "CLASS_B" | "CLASS_C";
 
 export interface Zone3PatternMatch {
@@ -125,6 +133,7 @@ export interface DashboardSnapshot {
   account: AccountSnapshot;
   killSwitchOn: boolean;
   targetSymbol: string;
+  globalContext: GlobalMacroContext;
   tick: Zone0Tick;
   technical: Zone1Technical;
   fundamental: Zone2Fundamental;
@@ -145,6 +154,7 @@ export interface DashboardUpdateEvent {
 export const SOCKET_EVENTS = {
   INIT: "dashboard:init",
   UPDATE: "dashboard:update",
+  ZONE0_RAW: "zone0:raw",
   COMMAND_KILL_SWITCH: "command:kill-switch",
   COMMAND_MANUAL_ORDER: "command:manual-order"
 } as const;
@@ -157,76 +167,83 @@ export function createEmptyDashboardSnapshot(): DashboardSnapshot {
       {
         name: "KIS_API",
         endpoint: "wss://openapi.koreainvestment.com",
-        state: "UP",
+        state: "DOWN",
         updatedAt: now
       },
       {
         name: "ORACLE_26AI",
         endpoint: "192.168.0.120:1521/AI_DB",
-        state: "UP",
+        state: "DOWN",
         updatedAt: now
       },
       {
         name: "LOCAL_LLM",
         endpoint: "192.168.0.3:11434",
-        state: "UP",
+        state: "DOWN",
         updatedAt: now
       }
     ],
     account: {
-      totalAssets: 50_000_000,
-      cashAvailable: 15_000_000,
+      totalAssets: 0,
+      cashAvailable: 0,
       realizedPnlPct: 0
     },
     killSwitchOn: false,
-    targetSymbol: "005930",
+    targetSymbol: "UNKNOWN",
+    globalContext: {
+      usdKrw: 0,
+      us10yYield: 0,
+      updatedAt: now,
+      usdKrwSource: "NO_DATA",
+      us10ySource: "NO_DATA"
+    },
     tick: {
-      symbol: "005930",
-      price: 71_000,
-      volume: 10_000,
-      bidDepth: 210_000,
-      askDepth: 190_000,
+      symbol: "UNKNOWN",
+      price: 0,
+      volume: 0,
+      bidDepth: 0,
+      askDepth: 0,
       timestamp: now
     },
     technical: {
-      volumePower: 101,
-      spikeRatio: 80,
+      volumePower: 0,
+      spikeRatio: 0,
       maDivergence: 0,
-      orderImbalance: 0.9,
-      support: 70_700,
-      resistance: 71_500,
+      orderImbalance: 0,
+      support: 0,
+      resistance: 0,
       updatedAt: now
     },
     fundamental: {
-      symbol: "005930",
-      riskFlag: "CLEAR",
-      issues: [],
+      symbol: "UNKNOWN",
+      riskFlag: "BLOCKED",
+      issues: ["실데이터 대기"],
       checkedAt: now
     },
     pattern: {
       klass: "CLASS_B",
-      similarity: 0.56,
-      matchedPatternId: "PATTERN_BOOTSTRAP",
+      similarity: 0,
+      matchedPatternId: "NO_DATA",
       updatedAt: now
     },
     madness: {
-      score: 35,
+      score: 0,
       stage: "STAGE_1",
-      sentiment: 0.12,
-      newsVelocity: 14,
+      sentiment: 0,
+      newsVelocity: 0,
       updatedAt: now
     },
     history: {
-      similarTradeId: "HIST_BOOTSTRAP",
-      winRate: 0.5,
-      summary: "초기 상태",
+      similarTradeId: "HIST_NONE",
+      winRate: 0,
+      summary: "실거래 이력 대기",
       updatedAt: now
     },
     decision: {
-      decisionId: "DEC_BOOTSTRAP",
+      decisionId: "DEC_INIT",
       action: "PASS",
-      confidenceScore: 0.5,
-      reasoning: "시스템 초기화 상태",
+      confidenceScore: 0,
+      reasoning: "실데이터 수신 전",
       suggestedWeightPct: 0,
       generatedAt: now
     },
@@ -235,4 +252,3 @@ export function createEmptyDashboardSnapshot(): DashboardSnapshot {
     lastUpdatedAt: now
   };
 }
-

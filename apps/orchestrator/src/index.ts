@@ -6,7 +6,9 @@ import cors from "cors";
 import express from "express";
 import { Server } from "socket.io";
 
+import { createOraclePersistence } from "./db/oracle-persistence.js";
 import { applyKillSwitch, applyManualOrder, initRuntime, stepRuntime } from "./pipeline.js";
+import { createTelegramChannelManager } from "./zones/zone0/telegram-manager.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -17,9 +19,11 @@ const io = new Server(server, {
 });
 
 let runtime = initRuntime();
+const telegramChannelManager = createTelegramChannelManager();
+const oraclePersistence = createOraclePersistence();
 const port = Number(process.env.ORCHESTRATOR_PORT ?? 5001);
-const tickIntervalMs = Number(process.env.TICK_INTERVAL_MS ?? 1_000);
 let stepping = false;
+let rerunRequested = false;
 
 app.use(cors());
 app.use(express.json());
@@ -39,6 +43,9 @@ app.get("/health", (_req, res) => {
       ticksBuffered: zone0Buffer.ticks.length,
       newsBuffered: zone0Buffer.newsItems.length,
       boardBuffered: zone0Buffer.boardPosts.length,
+      dartBuffered: zone0Buffer.dartDisclosures.length,
+      fundamentalBuffered: zone0Buffer.fundamentalData.length,
+      macroBuffered: zone0Buffer.globalContexts.length,
       telegramBuffered: zone0Buffer.telegramMessages.length,
       lastFrameAt: zone0Buffer.lastFrameAt
     },
@@ -157,6 +164,142 @@ app.post("/api/manual-order", (req, res) => {
   });
 });
 
+app.post("/api/zone0/telegram-webhook", (req, res) => {
+  const item = runtime.zone0.ingestTelegramWebhook(req.body ?? {});
+  if (!item) {
+    res.status(400).json({
+      ok: false,
+      error: "message 또는 text 필드가 필요합니다."
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    id: item.id
+  });
+});
+
+app.get("/api/zone0/telegram-channels", async (_req, res) => {
+  try {
+    const channels = await telegramChannelManager.listChannels();
+    res.json({
+      ok: true,
+      provider: telegramChannelManager.provider,
+      items: channels
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(500).json({
+      ok: false,
+      error: message
+    });
+  }
+});
+
+app.get("/api/zone0/telegram-channels/active", async (_req, res) => {
+  try {
+    const usernames = await telegramChannelManager.listActiveUsernames();
+    res.json(usernames);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(500).json({
+      ok: false,
+      error: message
+    });
+  }
+});
+
+app.post("/api/zone0/telegram-channels", async (req, res) => {
+  try {
+    const channel = await telegramChannelManager.createChannel({
+      channelUsername: String(req.body?.channelUsername ?? ""),
+      channelName: String(req.body?.channelName ?? ""),
+      isActive: req.body?.isActive === undefined ? true : Boolean(req.body.isActive)
+    });
+    res.status(201).json({
+      ok: true,
+      item: channel
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(400).json({
+      ok: false,
+      error: message
+    });
+  }
+});
+
+app.put("/api/zone0/telegram-channels/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id ?? "").trim();
+    if (!id) {
+      res.status(400).json({
+        ok: false,
+        error: "id가 필요합니다."
+      });
+      return;
+    }
+
+    const next = await telegramChannelManager.updateChannel(id, {
+      channelUsername: req.body?.channelUsername === undefined ? undefined : String(req.body.channelUsername),
+      channelName: req.body?.channelName === undefined ? undefined : String(req.body.channelName),
+      isActive: req.body?.isActive === undefined ? undefined : Boolean(req.body.isActive)
+    });
+
+    if (!next) {
+      res.status(404).json({
+        ok: false,
+        error: "채널을 찾을 수 없습니다."
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      item: next
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(400).json({
+      ok: false,
+      error: message
+    });
+  }
+});
+
+app.delete("/api/zone0/telegram-channels/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id ?? "").trim();
+    if (!id) {
+      res.status(400).json({
+        ok: false,
+        error: "id가 필요합니다."
+      });
+      return;
+    }
+
+    const deleted = await telegramChannelManager.deleteChannel(id);
+    if (!deleted) {
+      res.status(404).json({
+        ok: false,
+        error: "채널을 찾을 수 없습니다."
+      });
+      return;
+    }
+
+    res.json({
+      ok: true
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(500).json({
+      ok: false,
+      error: message
+    });
+  }
+});
+
 io.on("connection", (socket) => {
   socket.emit(SOCKET_EVENTS.INIT, {
     type: "SNAPSHOT",
@@ -185,27 +328,165 @@ function broadcastSnapshot(): void {
   });
 }
 
-setInterval(async () => {
+runtime.zone0.emitter.on("zone0:raw", () => {
+  void scheduleRuntimeStep();
+});
+
+runtime.zone0.emitter.on("zone0:raw", (frame) => {
+  io.emit(SOCKET_EVENTS.ZONE0_RAW, frame);
+  oraclePersistence.persistZone0Frame(frame);
+});
+
+async function scheduleRuntimeStep(): Promise<void> {
   if (stepping) {
+    rerunRequested = true;
     return;
   }
+
   stepping = true;
-  const baseRuntime = runtime;
   try {
-    const nextRuntime = await stepRuntime(baseRuntime);
-    if (runtime !== baseRuntime) {
-      return;
-    }
-    runtime = nextRuntime;
-    broadcastSnapshot();
+    do {
+      rerunRequested = false;
+      const baseRuntime = runtime;
+      const nextRuntime = await stepRuntime(baseRuntime);
+      if (runtime !== baseRuntime) {
+        continue;
+      }
+
+      if (nextRuntime !== baseRuntime) {
+        const nextSnapshot = nextRuntime.snapshot;
+        const zone2State = nextRuntime.zone2.getStateSnapshot();
+        const zone4State = nextRuntime.zone4.getStateSnapshot();
+        const zone5State = nextRuntime.zone5.getStateSnapshot();
+        const zone6Before = baseRuntime.zone6.getStateSnapshot();
+        const zone6After = nextRuntime.zone6.getStateSnapshot();
+
+        oraclePersistence.persistZone1Technical(nextSnapshot.targetSymbol, nextSnapshot.technical);
+        oraclePersistence.persistZone2Fundamental(nextSnapshot.fundamental, zone2State.source);
+        oraclePersistence.persistZone4Madness(nextSnapshot.targetSymbol, nextSnapshot.madness, zone4State.source);
+        oraclePersistence.persistZone5Decision({
+          snapshot: nextSnapshot,
+          source: zone5State.source,
+          archiveJson: zone5State.lastArchiveJson
+        });
+
+        if (
+          zone6After.recordCount > zone6Before.recordCount &&
+          zone6After.lastIngestedTradeId &&
+          typeof zone6After.lastIngestedPnlPct === "number"
+        ) {
+          const tradeInfo = parseZone6TradeInfo(
+            zone5State.lastArchiveJson,
+            nextSnapshot.targetSymbol,
+            zone5State.lastAction ?? "SELL"
+          );
+
+          oraclePersistence.persistZone6TradeOutcome({
+            tradeId: zone6After.lastIngestedTradeId,
+            symbol: tradeInfo.symbol,
+            action: tradeInfo.action,
+            realizedPnlPct: zone6After.lastIngestedPnlPct,
+            archiveJson: zone5State.lastArchiveJson ?? "{}",
+            closedAt: zone6After.lastUpdatedAt ?? nextSnapshot.lastUpdatedAt
+          });
+        }
+
+        runtime = nextRuntime;
+        broadcastSnapshot();
+      }
+    } while (rerunRequested || runtime.zone0.hasPendingFrame());
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[orchestrator] tick failed: ${message}`);
   } finally {
     stepping = false;
   }
-}, tickIntervalMs);
+}
 
 server.listen(port, () => {
   console.log(`[orchestrator] listening on http://localhost:${port}`);
+  void oraclePersistence.start();
+  void runtime.zone0
+    .start({
+      targetSymbol: runtime.snapshot.targetSymbol
+    })
+    .then(() => {
+      console.log(`[orchestrator] zone0 started for ${runtime.snapshot.targetSymbol}`);
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[orchestrator] zone0 start failed: ${message}`);
+    });
 });
+
+async function shutdown(): Promise<void> {
+  try {
+    await runtime.zone0.stop();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[orchestrator] zone0 stop failed: ${message}`);
+  }
+
+  try {
+    await oraclePersistence.shutdown();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[orchestrator] oracle persistence stop failed: ${message}`);
+  }
+
+  server.close(() => {
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 3_000).unref();
+}
+
+process.on("SIGINT", () => {
+  void shutdown();
+});
+
+process.on("SIGTERM", () => {
+  void shutdown();
+});
+
+function parseZone6TradeInfo(
+  archiveJson: string | null,
+  fallbackSymbol: string,
+  fallbackAction: string
+): { symbol: string; action: "BUY" | "SELL" | "PASS" } {
+  let symbol = fallbackSymbol;
+  let action: "BUY" | "SELL" | "PASS" = toDecisionAction(fallbackAction);
+
+  if (!archiveJson) {
+    return { symbol, action };
+  }
+
+  try {
+    const parsed = JSON.parse(archiveJson) as {
+      target_symbol?: unknown;
+      action?: unknown;
+    };
+
+    if (typeof parsed.target_symbol === "string" && parsed.target_symbol.trim().length > 0) {
+      symbol = parsed.target_symbol.trim();
+    }
+
+    if (typeof parsed.action === "string") {
+      action = toDecisionAction(parsed.action);
+    }
+  } catch {
+    return { symbol, action };
+  }
+
+  return { symbol, action };
+}
+
+function toDecisionAction(raw: string): "BUY" | "SELL" | "PASS" {
+  const value = raw.trim().toUpperCase();
+  if (value === "BUY" || value === "SELL" || value === "PASS") {
+    return value;
+  }
+  return "SELL";
+}
