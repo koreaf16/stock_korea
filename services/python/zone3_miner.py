@@ -8,6 +8,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
@@ -34,6 +35,8 @@ BACKOFF_MAX_SEC = max(BACKOFF_MIN_SEC, float(os.getenv("ZONE3_MINE_BACKOFF_MAX_S
 EVENT_UP_PCT = 15.0
 EVENT_DOWN_PCT = -10.0
 WINDOW_MINUTES = 30
+BATCH_SIZE = max(1, int(os.getenv("ZONE3_MINE_BATCH_SIZE", "50")))
+STAGING_DIR = Path(os.getenv("ZONE3_PATTERN_STAGING_DIR", "data/zone3_patterns"))
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,117 @@ class PatternRecord:
     symbol: str
     pattern_vector: list[float]
     sample_ohlvc_json: str
+
+
+def ensure_staging_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def pattern_record_to_dict(record: PatternRecord) -> dict[str, Any]:
+    return {
+        "pattern_id": record.pattern_id,
+        "klass": record.klass,
+        "symbol": record.symbol,
+        "pattern_vector": record.pattern_vector,
+        "sample_ohlvc_json": record.sample_ohlvc_json,
+    }
+
+
+def pattern_record_from_dict(payload: dict[str, Any]) -> PatternRecord:
+    return PatternRecord(
+        pattern_id=str(payload.get("pattern_id") or "").strip(),
+        klass=str(payload.get("klass") or "").strip(),
+        symbol=to_symbol(payload.get("symbol")),
+        pattern_vector=[float(v) for v in payload.get("pattern_vector") or []],
+        sample_ohlvc_json=str(payload.get("sample_ohlvc_json") or ""),
+    )
+
+
+def write_pattern_record_file(staging_dir: Path, record: PatternRecord) -> Path:
+    ensure_staging_dir(staging_dir)
+    path = staging_dir / f"{record.pattern_id}.json"
+    with path.open("w", encoding="utf-8") as fp:
+        json.dump(pattern_record_to_dict(record), fp, ensure_ascii=False, indent=2)
+    return path
+
+
+def iter_staged_record_files(staging_dir: Path) -> Iterable[Path]:
+    if not staging_dir.exists():
+        return []
+    return sorted(staging_dir.glob("*.json"))
+
+
+def has_local_record_for_symbol(staging_dir: Path, symbol: str) -> bool:
+    token = f"_{symbol}_"
+    for path in iter_staged_record_files(staging_dir):
+        if token in path.stem:
+            return True
+    return False
+
+
+def checkpoint_dir(staging_dir: Path) -> Path:
+    path = staging_dir / "_checkpoints"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def checkpoint_path(staging_dir: Path, symbol: str) -> Path:
+    return checkpoint_dir(staging_dir) / f"{symbol}.json"
+
+
+def was_symbol_processed_today(staging_dir: Path, symbol: str, today: dt.date) -> bool:
+    path = checkpoint_path(staging_dir, symbol)
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    processed_date = str(payload.get("processed_date") or "").strip()
+    return processed_date == today.isoformat()
+
+
+def mark_symbol_processed_today(staging_dir: Path, symbol: str, reason: str, event_count: int) -> None:
+    path = checkpoint_path(staging_dir, symbol)
+    payload = {
+        "symbol": symbol,
+        "processed_date": dt.date.today().isoformat(),
+        "processed_at": dt.datetime.now(dt.UTC).isoformat(),
+        "reason": reason,
+        "event_count": event_count,
+    }
+    with path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2)
+
+
+def replay_local_staged_records(staging_dir: Path, batch_size: int) -> int:
+    files = list(iter_staged_record_files(staging_dir))
+    if not files:
+        return 0
+
+    total_merged = 0
+    batch: list[PatternRecord] = []
+    for file_path in files:
+        try:
+            payload = json.loads(file_path.read_text(encoding="utf-8"))
+            record = pattern_record_from_dict(payload)
+            if not record.pattern_id or not record.symbol:
+                continue
+            batch.append(record)
+        except Exception as exc:
+            emit("log", f"[LOCAL] staged file parse failed file={file_path.name}: {exc}", level="warn")
+            continue
+
+        if len(batch) >= batch_size:
+            total_merged += upsert_patterns(batch)
+            batch.clear()
+
+    if batch:
+        total_merged += upsert_patterns(batch)
+        batch.clear()
+
+    return total_merged
 
 
 def emit(event_type: str, message: str, **extra: Any) -> None:
@@ -671,6 +785,7 @@ def run() -> None:
     today = dt.date.today()
     start_date = today - dt.timedelta(days=365 * 2)
     end_date = today
+    staging_dir = ensure_staging_dir(STAGING_DIR)
 
     exclude_keywords = [token.strip() for token in str(args.exclude_keywords).split(",") if token.strip()]
     listing = get_market_symbols(exclude_keywords=exclude_keywords)
@@ -681,6 +796,14 @@ def run() -> None:
     except Exception as exc:
         emit("log", f"[DB] 기존 적재 종목 조회 실패, 전체 스캔으로 진행: {exc}", level="warn")
         existing_symbols = set()
+
+    staged_replayed = 0
+    try:
+        staged_replayed = replay_local_staged_records(staging_dir, BATCH_SIZE)
+        if staged_replayed > 0:
+            emit("log", f"[LOCAL] staged records replay complete merged={staged_replayed}", level="info")
+    except Exception as exc:
+        emit("log", f"[LOCAL] staged records replay failed: {exc}", level="warn")
 
     if existing_symbols:
         listing = listing[~listing["Symbol"].isin(existing_symbols)].reset_index(drop=True)
@@ -707,11 +830,34 @@ def run() -> None:
         end_date=str(end_date),
         symbols_total=min(args.symbol_limit, len(listing)),
         resume_skip_symbols=len(existing_symbols),
+        staged_replayed=staged_replayed,
+        batch_size=BATCH_SIZE,
+        staging_dir=str(staging_dir.resolve()),
         kis_enabled=kis.enabled,
     )
 
     records: list[PatternRecord] = []
+    total_buffered = 0
+    total_merged = staged_replayed
+    class_a = 0
+    class_c = 0
     processed_symbols = 0
+
+    def flush_batch(force: bool = False) -> None:
+        nonlocal total_merged, total_buffered
+        if not records:
+            return
+        if not force and len(records) < BATCH_SIZE:
+            return
+        merged = upsert_patterns(records)
+        total_merged += merged
+        total_buffered += len(records)
+        emit(
+            "log",
+            f"[DB] batch upsert requested={len(records)} merged={merged} total_merged={total_merged}",
+            level="info",
+        )
+        records.clear()
 
     for idx, total, symbol, name in iter_symbols(listing, args.symbol_limit):
         processed_symbols += 1
@@ -740,8 +886,19 @@ def run() -> None:
         # 이벤트 과다 시 상위 변동폭부터 처리
         events = sorted(events, key=lambda e: abs(e.pct_change), reverse=True)[: max(1, args.max_events_per_symbol)]
 
+        local_history_exists = has_local_record_for_symbol(staging_dir, symbol)
+        processed_today = was_symbol_processed_today(staging_dir, symbol, today)
+        if local_history_exists or processed_today:
+            reason = "로컬 파일 체크포인트 존재" if local_history_exists else "당일 처리 체크포인트 존재"
+            emit("log", f"[{symbol}] {reason}로 KIS 분봉 호출 생략, 이벤트 {len(events)}건 skip", level="warn")
+            mark_symbol_processed_today(staging_dir, symbol, reason=reason, event_count=len(events))
+            progress = int((idx / max(1, total)) * 100)
+            emit("progress", f"{symbol} 처리 완료", progress=progress, processed_symbols=processed_symbols, records=len(records))
+            continue
+
         if not kis.enabled:
             emit("log", f"[{symbol}] KIS 비활성화로 분봉 수집 불가, 이벤트 {len(events)}건 skip", level="warn")
+            mark_symbol_processed_today(staging_dir, symbol, reason="KIS disabled", event_count=len(events))
             progress = int((idx / max(1, total)) * 100)
             emit("progress", f"{symbol} 처리 완료", progress=progress, processed_symbols=processed_symbols, records=len(records))
             continue
@@ -791,31 +948,38 @@ def run() -> None:
                     sample_ohlvc_json=sample_json,
                 )
             )
+            if event.klass == "CLASS_A":
+                class_a += 1
+            elif event.klass == "CLASS_C":
+                class_c += 1
+            write_pattern_record_file(staging_dir, records[-1])
             emit(
                 "log",
                 f"{symbol} {event.event_date} {event.klass} 벡터화 완료 pattern_id={pattern_id}",
                 level="info",
             )
+            flush_batch(force=False)
+
+        mark_symbol_processed_today(staging_dir, symbol, reason="processed", event_count=len(events))
 
         progress = int((idx / max(1, total)) * 100)
         emit("progress", f"{symbol} 처리 완료", progress=progress, processed_symbols=processed_symbols, records=len(records))
 
-    if not records:
+    flush_batch(force=True)
+    if total_buffered == 0 and staged_replayed == 0:
         emit("completed", "생성된 패턴이 없어 DB 적재를 건너뜀", running=False, progress=100, inserted=0)
         return
 
-    inserted = upsert_patterns(records)
-    class_a = sum(1 for r in records if r.klass == "CLASS_A")
-    class_c = sum(1 for r in records if r.klass == "CLASS_C")
     emit(
         "completed",
-        f"Zone3 마이닝 완료 records={len(records)} merged={inserted}",
+        f"Zone3 마이닝 완료 records={total_buffered} merged={total_merged}",
         running=False,
         progress=100,
-        processed=len(records),
-        inserted=inserted,
+        processed=total_buffered,
+        inserted=total_merged,
         class_a=class_a,
         class_c=class_c,
+        staged_replayed=staged_replayed,
     )
 
 
