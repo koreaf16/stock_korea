@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@stock/contracts": "*",
+    "lucide-react": "^0.577.0",
     "next": "^16.1.6",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

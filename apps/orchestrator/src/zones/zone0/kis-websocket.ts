@@ -1,0 +1,381 @@
+import axios from "axios";
+import WebSocket from "ws";
+
+const DEFAULT_SYMBOL = "005930";
+const EXECUTION_TR_ID = "H0STCNT0";
+const APPROVAL_PATH = "/oauth2/Approval";
+
+type KisLogger = Pick<Console, "info" | "warn" | "error" | "debug">;
+
+interface KisEnv {
+  appKey: string;
+  appSecret: string;
+  wsUrl: string;
+  restUrl: string;
+}
+
+export interface KisExecutionTick {
+  symbol: string;
+  price: number;
+  volume: number;
+  volumePower: number;
+  tradeTime: string;
+  receivedAt: string;
+  raw: string;
+}
+
+export interface KisWebSocketOptions {
+  targetSymbol?: string;
+  reconnectDelayMs?: number;
+  logger?: KisLogger;
+  onTick?: (tick: KisExecutionTick) => void;
+  onControlMessage?: (payload: unknown) => void;
+}
+
+interface ApprovalResponse {
+  approval_key?: string;
+}
+
+export class KisWebSocketClient {
+  private readonly env: KisEnv;
+  private readonly reconnectDelayMs: number;
+  private readonly logger: KisLogger;
+
+  private ws: WebSocket | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private stopped = true;
+  private connecting = false;
+  private approvalKey: string | null = null;
+  private targetSymbol: string;
+  private readonly onTick?: (tick: KisExecutionTick) => void;
+  private readonly onControlMessage?: (payload: unknown) => void;
+
+  constructor(options: KisWebSocketOptions = {}) {
+    this.env = loadKisEnv();
+    this.targetSymbol = sanitizeSymbol(options.targetSymbol ?? DEFAULT_SYMBOL);
+    this.reconnectDelayMs = Math.max(500, options.reconnectDelayMs ?? 3_000);
+    this.logger = options.logger ?? console;
+    this.onTick = options.onTick;
+    this.onControlMessage = options.onControlMessage;
+  }
+
+  public async start(symbol?: string): Promise<void> {
+    // 1) 외부에서 타겟 종목을 주입하면 런타임 타겟을 교체한다.
+    if (symbol) {
+      this.targetSymbol = sanitizeSymbol(symbol);
+    }
+
+    this.stopped = false;
+    await this.connect();
+  }
+
+  public async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    this.approvalKey = null;
+
+    if (this.ws) {
+      const socket = this.ws;
+      this.ws = null;
+      socket.removeAllListeners();
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close();
+      }
+    }
+  }
+
+  public getCurrentSymbol(): string {
+    return this.targetSymbol;
+  }
+
+  public async changeSymbol(nextSymbol: string): Promise<void> {
+    this.targetSymbol = sanitizeSymbol(nextSymbol);
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.approvalKey) {
+      return;
+    }
+
+    // 2) 이미 소켓이 열린 상태면 기존 연결 재사용 + 신규 종목 구독을 추가 전송한다.
+    this.sendExecutionSubscribe(this.ws, this.approvalKey, this.targetSymbol);
+  }
+
+  private async connect(): Promise<void> {
+    if (this.stopped || this.connecting) {
+      return;
+    }
+
+    this.connecting = true;
+
+    try {
+      // 3) WebSocket 연결 전에 REST API로 approval_key를 발급받는다.
+      const approvalKey = await this.fetchApprovalKey();
+      if (this.stopped) {
+        return;
+      }
+
+      // 4) 발급받은 approval_key로 KIS WebSocket 서버에 접속한다.
+      await this.openSocket(approvalKey);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`[KIS][WS] 연결 실패: ${message}`);
+      this.scheduleReconnect("initial-connect-failed");
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  private async fetchApprovalKey(): Promise<string> {
+    const url = buildUrl(this.env.restUrl, APPROVAL_PATH);
+    const response = await axios.post<ApprovalResponse>(
+      url,
+      {
+        grant_type: "client_credentials",
+        appkey: this.env.appKey,
+        secretkey: this.env.appSecret
+      },
+      {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        timeout: 10_000
+      }
+    );
+
+    const approvalKey = response.data.approval_key;
+    if (!approvalKey) {
+      throw new Error("approval_key 발급 실패 (응답에 approval_key 없음)");
+    }
+
+    this.logger.info("[KIS][REST] approval_key 발급 완료");
+    this.approvalKey = approvalKey;
+    return approvalKey;
+  }
+
+  private async openSocket(approvalKey: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(this.env.wsUrl);
+      let settled = false;
+
+      const cleanupBeforeReject = (error: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        socket.removeAllListeners();
+        reject(error);
+      };
+
+      socket.once("open", () => {
+        settled = true;
+        this.ws = socket;
+        this.logger.info(`[KIS][WS] 연결 성공: ${this.env.wsUrl}`);
+
+        // 5) 소켓 연결 직후 실시간 체결(H0STCNT0) 구독 요청을 보낸다.
+        this.sendExecutionSubscribe(socket, approvalKey, this.targetSymbol);
+        resolve();
+      });
+
+      socket.on("message", (rawData: WebSocket.RawData) => {
+        this.handleIncomingMessage(rawData);
+      });
+
+      socket.on("close", (code: number, reasonBuffer: Buffer) => {
+        const reasonText = reasonBuffer.toString("utf8");
+        this.logger.warn(`[KIS][WS] 연결 종료 code=${code} reason=${reasonText || "-"}`);
+        if (this.ws === socket) {
+          this.ws = null;
+        }
+        if (!this.stopped) {
+          this.scheduleReconnect("socket-close");
+        }
+      });
+
+      socket.on("error", (error: Error) => {
+        this.logger.error(`[KIS][WS] 소켓 에러: ${error.message}`);
+        if (!settled) {
+          cleanupBeforeReject(error);
+        }
+      });
+    });
+  }
+
+  private sendExecutionSubscribe(socket: WebSocket, approvalKey: string, symbol: string): void {
+    const payload = {
+      header: {
+        approval_key: approvalKey,
+        custtype: "P",
+        tr_type: "1",
+        "content-type": "utf-8"
+      },
+      body: {
+        input: {
+          tr_id: EXECUTION_TR_ID,
+          tr_key: symbol
+        }
+      }
+    };
+
+    socket.send(JSON.stringify(payload));
+    this.logger.info(`[KIS][WS] ${EXECUTION_TR_ID} 구독 요청 전송: ${symbol}`);
+  }
+
+  private handleIncomingMessage(rawData: WebSocket.RawData): void {
+    const text = toUtf8(rawData).trim();
+    if (!text) {
+      return;
+    }
+
+    if (text.startsWith("PINGPONG")) {
+      this.logger.debug("[KIS][WS] PINGPONG 수신");
+      return;
+    }
+
+    // 6) 제어 메시지(JSON)와 실시간 체결 텍스트를 분기 처리한다.
+    if (text.startsWith("{")) {
+      this.handleControlJson(text);
+      return;
+    }
+
+    // 7) 실시간 틱 텍스트는 split('|') + split('^') 방식으로 고정 파싱한다.
+    const tick = parseExecutionTick(text, this.targetSymbol);
+    if (!tick) {
+      return;
+    }
+
+    this.logger.info(
+      `[KIS][TICK] ${tick.symbol} | 현재가 ${tick.price.toLocaleString("ko-KR")} | 체결량 ${tick.volume.toLocaleString("ko-KR")} | 체결강도 ${tick.volumePower.toFixed(2)}`
+    );
+    this.onTick?.(tick);
+  }
+
+  private handleControlJson(text: string): void {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      this.onControlMessage?.(parsed);
+      this.logger.debug(`[KIS][WS][CTRL] ${text}`);
+    } catch {
+      this.logger.warn(`[KIS][WS][CTRL] JSON 파싱 실패: ${text}`);
+    }
+  }
+
+  private scheduleReconnect(reason: string): void {
+    // 8) 장중 연결 끊김 대비: 단순 자동 재연결 스켈레톤.
+    if (this.stopped || this.reconnectTimer) {
+      return;
+    }
+
+    this.logger.warn(`[KIS][WS] ${reason}, ${this.reconnectDelayMs}ms 후 재연결`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect();
+    }, this.reconnectDelayMs);
+  }
+}
+
+export function parseExecutionTick(message: string, fallbackSymbol = DEFAULT_SYMBOL): KisExecutionTick | null {
+  const pipe = message.split("|");
+  if (pipe.length < 4) {
+    return null;
+  }
+
+  const dataType = pipe[0];
+  const trId = pipe[1];
+  const payload = pipe[3];
+  if (dataType !== "0" || trId !== EXECUTION_TR_ID || !payload) {
+    return null;
+  }
+
+  const fields = payload.split("^");
+  if (fields.length === 0) {
+    return null;
+  }
+
+  const symbol = fields[0] && fields[0].length > 0 ? fields[0] : fallbackSymbol;
+  const tradeTime = fields[1] ?? "";
+
+  // H0STCNT0 포맷은 브로커 스펙/채널별로 필드 위치가 다를 수 있어 우선순위 인덱스로 안전 파싱한다.
+  const price = pickNumber(fields, [2, 1]);
+  const volume = pickNumber(fields, [12, 13, 14], 0);
+  const volumePower = pickNumber(fields, [18, 19, 20], 0);
+
+  if (!Number.isFinite(price) || price <= 0) {
+    return null;
+  }
+
+  return {
+    symbol,
+    price,
+    volume: Number.isFinite(volume) ? volume : 0,
+    volumePower: Number.isFinite(volumePower) ? volumePower : 0,
+    tradeTime,
+    receivedAt: new Date().toISOString(),
+    raw: message
+  };
+}
+
+function pickNumber(fields: string[], indices: number[], fallback = Number.NaN): number {
+  for (const index of indices) {
+    const raw = fields[index];
+    const parsed = toNumber(raw);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function toNumber(value: string | undefined): number {
+  if (!value || value.length === 0) {
+    return Number.NaN;
+  }
+
+  const normalized = value.includes(",") ? value.split(",").join("") : value;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function loadKisEnv(): KisEnv {
+  return {
+    appKey: requiredEnv("KIS_APP_KEY"),
+    appSecret: requiredEnv("KIS_APP_SECRET"),
+    wsUrl: requiredEnv("KIS_WS_URL"),
+    restUrl: requiredEnv("KIS_REST_URL")
+  };
+}
+
+function requiredEnv(name: "KIS_APP_KEY" | "KIS_APP_SECRET" | "KIS_WS_URL" | "KIS_REST_URL"): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`[KIS] 필수 환경변수 누락: ${name}`);
+  }
+  return value;
+}
+
+function sanitizeSymbol(symbol: string): string {
+  const trimmed = symbol.trim();
+  return trimmed.length > 0 ? trimmed : DEFAULT_SYMBOL;
+}
+
+function buildUrl(baseUrl: string, path: string): string {
+  const normalizedBase = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+  return `${normalizedBase}${path}`;
+}
+
+function toUtf8(rawData: WebSocket.RawData): string {
+  if (typeof rawData === "string") {
+    return rawData;
+  }
+  if (rawData instanceof Buffer) {
+    return rawData.toString("utf8");
+  }
+  if (Array.isArray(rawData)) {
+    return Buffer.concat(rawData).toString("utf8");
+  }
+  if (rawData instanceof ArrayBuffer) {
+    return Buffer.from(new Uint8Array(rawData)).toString("utf8");
+  }
+  return Buffer.from(rawData.buffer, rawData.byteOffset, rawData.byteLength).toString("utf8");
+}
