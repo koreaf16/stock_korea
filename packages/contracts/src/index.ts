@@ -162,10 +162,30 @@ export interface DashboardUpdateEvent {
   payload: DashboardSnapshot;
 }
 
+export interface Zone3MiningSocketEvent {
+  type: "status" | "progress" | "log" | "completed" | "error" | "stats";
+  timestamp: string;
+  running: boolean;
+  progress: number;
+  message: string;
+  level?: "info" | "warn" | "error";
+  processed?: number;
+  inserted?: number;
+  stats?: {
+    totalPatterns: number;
+    classA: number;
+    classC: number;
+    classARatio: number;
+    classCRatio: number;
+    lastUpdatedAt: string | null;
+  };
+}
+
 export const SOCKET_EVENTS = {
   INIT: "dashboard:init",
   UPDATE: "dashboard:update",
   ZONE0_RAW: "zone0:raw",
+  ZONE3_MINING: "zone3:mining",
   COMMAND_KILL_SWITCH: "command:kill-switch",
   COMMAND_MANUAL_ORDER: "command:manual-order"
 } as const;

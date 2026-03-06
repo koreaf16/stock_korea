@@ -1,6 +1,6 @@
 "use client";
 
-import { createEmptyDashboardSnapshot, type DashboardSnapshot } from "@stock/contracts";
+import { createEmptyDashboardSnapshot, type DashboardSnapshot, type Zone3MiningSocketEvent } from "@stock/contracts";
 import { create } from "zustand";
 
 import { formatKrw, formatTs } from "./format";
@@ -13,10 +13,29 @@ const MAX_BRAIN_LOGS = 24;
 const MAX_FEED_ITEMS = 50;
 const MAX_TELEGRAM_ITEMS = 50;
 const MAX_TARGET_LOGS = 24;
+const MAX_ZONE3_MINING_LOGS = 250;
 
 export interface UiLogLine {
   id: string;
   text: string;
+}
+
+export interface Zone3MiningState {
+  running: boolean;
+  progress: number;
+  lastMessage: string;
+  lastUpdatedAt: string | null;
+  processed: number;
+  inserted: number;
+  stats: {
+    totalPatterns: number;
+    classA: number;
+    classC: number;
+    classARatio: number;
+    classCRatio: number;
+    lastUpdatedAt: string | null;
+  } | null;
+  logs: UiLogLine[];
 }
 
 export interface Zone0OrderBookLevel {
@@ -136,12 +155,15 @@ interface DashboardStore {
   tickLogs: UiLogLine[];
   brainLogs: UiLogLine[];
   targetLogs: UiLogLine[];
+  zone3Mining: Zone3MiningState;
   setConnected: (connected: boolean) => void;
   setHealth: (health: OrchestratorHealth) => void;
   setHealthError: (error: string | null) => void;
   mergeSymbolNames: (entries: Record<string, string>) => void;
   setSnapshot: (snapshot: DashboardSnapshot) => void;
   setZone0RawFrame: (frame: Zone0RawFrame) => void;
+  setZone3MiningEvent: (event: Zone3MiningSocketEvent) => void;
+  clearZone3MiningLogs: () => void;
 }
 
 export const useDashboardStore = create<DashboardStore>((set) => ({
@@ -160,6 +182,16 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
   tickLogs: [],
   brainLogs: [],
   targetLogs: [],
+  zone3Mining: {
+    running: false,
+    progress: 0,
+    lastMessage: "대기 중",
+    lastUpdatedAt: null,
+    processed: 0,
+    inserted: 0,
+    stats: null,
+    logs: []
+  },
   setConnected: (connected) => {
     set({ connected });
   },
@@ -276,6 +308,43 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
         telegramFeed
       };
     });
+  },
+  setZone3MiningEvent: (event) => {
+    set((state) => {
+      const level = event.level ?? (event.type === "error" ? "error" : event.type === "completed" ? "info" : "info");
+      const prefix = level === "error" ? "[ERR]" : level === "warn" ? "[WARN]" : "[INFO]";
+      const logLine = `[${formatTs(event.timestamp)}] ${prefix} ${event.message}`;
+      const logId = `z3m:${state.logSeq + 1}:${event.timestamp}`;
+
+      const nextStats =
+        event.stats ??
+        state.zone3Mining.stats;
+
+      return {
+        logSeq: state.logSeq + 1,
+        zone3Mining: {
+          running: event.running,
+          progress: event.progress,
+          lastMessage: event.message,
+          lastUpdatedAt: event.timestamp,
+          processed: event.processed ?? state.zone3Mining.processed,
+          inserted: event.inserted ?? state.zone3Mining.inserted,
+          stats: nextStats,
+          logs:
+            event.type === "status" && event.message === "idle"
+              ? state.zone3Mining.logs
+              : [{ id: logId, text: logLine }, ...state.zone3Mining.logs].slice(0, MAX_ZONE3_MINING_LOGS)
+        }
+      };
+    });
+  },
+  clearZone3MiningLogs: () => {
+    set((state) => ({
+      zone3Mining: {
+        ...state.zone3Mining,
+        logs: []
+      }
+    }));
   }
 }));
 

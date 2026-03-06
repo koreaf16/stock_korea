@@ -1,6 +1,6 @@
 "use client";
 
-import type { DashboardUpdateEvent } from "@stock/contracts";
+import type { DashboardUpdateEvent, Zone3MiningSocketEvent } from "@stock/contracts";
 import { SOCKET_EVENTS } from "@stock/contracts";
 import { useEffect } from "react";
 import { io } from "socket.io-client";
@@ -8,26 +8,27 @@ import { io } from "socket.io-client";
 import { useDashboardStore, type Zone0RawFrame } from "./store";
 
 const ORCHESTRATOR_URL = process.env.NEXT_PUBLIC_ORCHESTRATOR_URL ?? "http://localhost:5001";
-const DASHBOARD_MAX_FPS = Math.max(8, Number(process.env.NEXT_PUBLIC_DASHBOARD_MAX_FPS ?? 12));
-const SNAPSHOT_FLUSH_MS = Math.max(120, Math.round(1000 / DASHBOARD_MAX_FPS));
+const DASHBOARD_MAX_FPS = Math.min(60, Math.max(1, Number(process.env.NEXT_PUBLIC_DASHBOARD_MAX_FPS ?? 30)));
+const SNAPSHOT_FLUSH_MS = Math.max(16, Math.round(1000 / DASHBOARD_MAX_FPS));
 
 export function useDashboardSocket(): void {
   const setConnected = useDashboardStore((state) => state.setConnected);
   const setSnapshot = useDashboardStore((state) => state.setSnapshot);
   const setZone0RawFrame = useDashboardStore((state) => state.setZone0RawFrame);
+  const setZone3MiningEvent = useDashboardStore((state) => state.setZone3MiningEvent);
 
   useEffect(() => {
     let pendingSnapshot: DashboardUpdateEvent["payload"] | null = null;
     let pendingZone0Raw: Zone0RawFrame | null = null;
-    let flushTimeout: ReturnType<typeof setTimeout> | null = null;
+    let rafId: number | null = null;
     let lastFlushAt = 0;
 
-    const flush = () => {
-      if (flushTimeout) {
-        clearTimeout(flushTimeout);
-        flushTimeout = null;
+    const flush = (force = false) => {
+      const now = performance.now();
+      if (!force && now - lastFlushAt < SNAPSHOT_FLUSH_MS) {
+        return false;
       }
-      lastFlushAt = Date.now();
+      lastFlushAt = now;
 
       if (!pendingSnapshot) {
         if (pendingZone0Raw) {
@@ -43,18 +44,25 @@ export function useDashboardSocket(): void {
         setZone0RawFrame(pendingZone0Raw);
         pendingZone0Raw = null;
       }
+      return true;
     };
 
     const scheduleFlush = () => {
-      const now = Date.now();
-      const wait = SNAPSHOT_FLUSH_MS - (now - lastFlushAt);
-      if (wait <= 0) {
-        flush();
+      if (rafId !== null) {
         return;
       }
-      if (!flushTimeout) {
-        flushTimeout = setTimeout(flush, wait);
-      }
+
+      const tick = () => {
+        rafId = null;
+        if (flush()) {
+          return;
+        }
+        if (pendingSnapshot || pendingZone0Raw) {
+          scheduleFlush();
+        }
+      };
+
+      rafId = requestAnimationFrame(tick);
     };
 
     const socket = io(ORCHESTRATOR_URL, {
@@ -76,7 +84,7 @@ export function useDashboardSocket(): void {
     socket.on(SOCKET_EVENTS.INIT, (event: DashboardUpdateEvent) => {
       if (event?.payload) {
         pendingSnapshot = event.payload;
-        flush();
+        flush(true);
       }
     });
 
@@ -94,15 +102,21 @@ export function useDashboardSocket(): void {
       }
     });
 
+    socket.on(SOCKET_EVENTS.ZONE3_MINING, (event: Zone3MiningSocketEvent) => {
+      if (event?.type) {
+        setZone3MiningEvent(event);
+      }
+    });
+
     return () => {
-      if (flushTimeout) {
-        clearTimeout(flushTimeout);
-        flushTimeout = null;
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
       }
       pendingSnapshot = null;
       pendingZone0Raw = null;
       socket.removeAllListeners();
       socket.disconnect();
     };
-  }, [setConnected, setSnapshot, setZone0RawFrame]);
+  }, [setConnected, setSnapshot, setZone0RawFrame, setZone3MiningEvent]);
 }

@@ -1,7 +1,21 @@
 "use client";
 
 import type { DashboardSnapshot } from "@stock/contracts";
-import { useMemo, useState } from "react";
+import {
+  AreaSeries,
+  CandlestickSeries,
+  ColorType,
+  LineSeries,
+  createChart,
+  LineStyle,
+  type AreaData,
+  type IChartApi,
+  type IPriceLine,
+  type ISeriesApi,
+  type LineData,
+  type UTCTimestamp
+} from "lightweight-charts";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { formatPct } from "@/lib/format";
 import { decisionActionKo, madnessStageKo, narrativeKo, patternClassKo, sourceKo } from "@/lib/korean";
@@ -17,7 +31,8 @@ interface CenterPanelProps {
   brainLogs: UiLogLine[];
 }
 
-interface Candle {
+interface CandlePoint {
+  time: UTCTimestamp;
   open: number;
   high: number;
   low: number;
@@ -26,61 +41,97 @@ interface Candle {
 
 type ViewMode = "1m" | "3m";
 
-function buildCandles(series: number[], viewMode: ViewMode): Candle[] {
-  if (series.length < 4) {
+function toEpochSeconds(iso: string | undefined): number {
+  const parsed = Date.parse(String(iso ?? ""));
+  if (!Number.isFinite(parsed)) {
+    return Math.floor(Date.now() / 1_000);
+  }
+  return Math.floor(parsed / 1_000);
+}
+
+function buildCandles(series: number[], viewMode: ViewMode, lastTickAt: string): CandlePoint[] {
+  if (series.length < 2) {
     return [];
   }
 
-  const baseBucketSize = Math.max(3, Math.floor(series.length / 28));
-  const bucketSize = viewMode === "3m" ? baseBucketSize * 3 : baseBucketSize;
-  const candles: Candle[] = [];
+  const targetCandles = viewMode === "1m" ? 56 : 36;
+  const bucketSize = Math.max(1, Math.floor(series.length / targetCandles));
+  const intervalSec = viewMode === "1m" ? 60 : 180;
 
+  const chunks: number[][] = [];
   for (let start = 0; start < series.length; start += bucketSize) {
-    const chunk = series.slice(start, start + bucketSize);
-    const first = chunk[0];
-    const last = chunk[chunk.length - 1];
-    if (first === undefined || last === undefined) {
+    const chunk = series.slice(start, Math.min(start + bucketSize, series.length));
+    if (chunk.length > 0) {
+      chunks.push(chunk);
+    }
+  }
+
+  const endTime = toEpochSeconds(lastTickAt);
+  const firstTime = endTime - (chunks.length - 1) * intervalSec;
+
+  return chunks.map((chunk, index) => {
+    const open = chunk[0] ?? 0;
+    const close = chunk[chunk.length - 1] ?? open;
+    const high = Math.max(...chunk);
+    const low = Math.min(...chunk);
+    return {
+      time: (firstTime + index * intervalSec) as UTCTimestamp,
+      open,
+      high,
+      low,
+      close
+    };
+  });
+}
+
+function buildGhostSeries(candles: CandlePoint[], klass: DashboardSnapshot["pattern"]["klass"], viewMode: ViewMode): LineData<UTCTimestamp>[] {
+  if (candles.length < 6) {
+    return [];
+  }
+
+  const tail = candles.slice(-18).map((item) => item.close);
+  const returns: number[] = [];
+  for (let index = 1; index < tail.length; index += 1) {
+    const prev = tail[index - 1];
+    const curr = tail[index];
+    if (prev === undefined || curr === undefined) {
       continue;
     }
+    const change = prev === 0 ? 0 : (curr - prev) / prev;
+    returns.push(Math.max(-0.05, Math.min(0.05, change)));
+  }
 
-    candles.push({
-      open: first,
-      high: Math.max(...chunk),
-      low: Math.min(...chunk),
-      close: last
+  const avgReturn = returns.length > 0 ? returns.reduce((acc, value) => acc + value, 0) / returns.length : 0;
+  const intervalSec = viewMode === "1m" ? 60 : 180;
+  const steps = 14;
+  const lastCandle = candles[candles.length - 1];
+  if (!lastCandle) {
+    return [];
+  }
+
+  let projected = lastCandle.close;
+  const ghost: LineData<UTCTimestamp>[] = [{ time: lastCandle.time, value: projected }];
+
+  for (let step = 1; step <= steps; step += 1) {
+    const templateReturn = returns[(step - 1) % Math.max(1, returns.length)] ?? avgReturn;
+    let directionalReturn = templateReturn * 0.6 + avgReturn * 0.4;
+
+    if (klass === "CLASS_A") {
+      directionalReturn = Math.max(0, directionalReturn) * 1.12 + avgReturn * 0.12;
+    } else if (klass === "CLASS_C") {
+      directionalReturn = Math.min(0, directionalReturn) * 1.12 + avgReturn * 0.12;
+    }
+
+    directionalReturn = Math.max(-0.03, Math.min(0.03, directionalReturn));
+    projected = Math.max(1, projected * (1 + directionalReturn));
+
+    ghost.push({
+      time: (lastCandle.time + step * intervalSec) as UTCTimestamp,
+      value: projected
     });
   }
 
-  return candles;
-}
-
-function toY(value: number, minPrice: number, maxPrice: number, height: number): number {
-  const span = Math.max(1, maxPrice - minPrice);
-  return height - ((value - minPrice) / span) * height;
-}
-
-function ghostPath(klass: DashboardSnapshot["pattern"]["klass"], width: number, height: number): string {
-  const points: Array<[number, number]> = [];
-  const n = 42;
-
-  for (let i = 0; i < n; i += 1) {
-    const t = i / (n - 1);
-    let y = 0.5;
-
-    if (klass === "CLASS_A") {
-      y = 0.62 - 0.44 * t - Math.max(0, t - 0.72) * 0.24;
-    } else if (klass === "CLASS_C") {
-      y = 0.36 + 0.41 * t + Math.max(0, t - 0.68) * 0.18;
-    } else {
-      y = 0.5 + Math.sin(t * Math.PI * 3.5) * 0.06;
-    }
-
-    points.push([t * width, y * height]);
-  }
-
-  return points
-    .map(([x, y], index) => `${index === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`)
-    .join(" ");
+  return ghost;
 }
 
 function gaugeGradient(score: number): string {
@@ -94,35 +145,213 @@ function gaugeGradient(score: number): string {
   return `conic-gradient(#38bdf8 ${pct}%, rgba(15, 23, 42, 0.2) 0)`;
 }
 
-function fmtPrice(value: number): string {
-  return Math.round(value).toLocaleString();
+function TacticalChart({
+  snapshot,
+  health,
+  priceSeries,
+  viewMode
+}: {
+  snapshot: DashboardSnapshot;
+  health: OrchestratorHealth | null;
+  priceSeries: number[];
+  viewMode: ViewMode;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const ghostLineRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const ghostAreaRef = useRef<ISeriesApi<"Area"> | null>(null);
+  const supportLineRef = useRef<IPriceLine | null>(null);
+  const resistanceLineRef = useRef<IPriceLine | null>(null);
+
+  const candles = useMemo(() => buildCandles(priceSeries, viewMode, snapshot.tick.timestamp), [priceSeries, snapshot.tick.timestamp, viewMode]);
+  const ghostSeries = useMemo(
+    () => buildGhostSeries(candles, snapshot.pattern.klass, viewMode),
+    [candles, snapshot.pattern.klass, viewMode]
+  );
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const chart = createChart(container, {
+      width: container.clientWidth,
+      height: container.clientHeight,
+      layout: {
+        background: { type: ColorType.Solid, color: "rgba(2, 6, 23, 0.78)" },
+        textColor: "#cbd5e1",
+        fontFamily: "JetBrains Mono, D2Coding, Consolas, monospace"
+      },
+      grid: {
+        vertLines: { color: "rgba(71,85,105,0.18)" },
+        horzLines: { color: "rgba(71,85,105,0.18)" }
+      },
+      rightPriceScale: {
+        borderColor: "rgba(100,116,139,0.35)",
+        autoScale: true
+      },
+      timeScale: {
+        borderColor: "rgba(100,116,139,0.35)",
+        rightOffset: 4,
+        timeVisible: true,
+        secondsVisible: false
+      },
+      crosshair: {
+        vertLine: {
+          labelBackgroundColor: "rgba(8,47,73,0.95)"
+        },
+        horzLine: {
+          labelBackgroundColor: "rgba(8,47,73,0.95)"
+        }
+      }
+    });
+
+    const candleSeries = chart.addSeries(CandlestickSeries, {
+      upColor: "#f87171",
+      downColor: "#60a5fa",
+      borderVisible: false,
+      wickUpColor: "#fca5a5",
+      wickDownColor: "#93c5fd",
+      priceLineVisible: true,
+      lastValueVisible: true
+    });
+
+    const ghostLine = chart.addSeries(LineSeries, {
+      color: "rgba(226,232,240,0.58)",
+      lineWidth: 2,
+      lineStyle: LineStyle.Dashed,
+      lastValueVisible: false,
+      priceLineVisible: false
+    });
+
+    const ghostArea = chart.addSeries(AreaSeries, {
+      lineColor: "rgba(148,163,184,0.28)",
+      topColor: "rgba(148,163,184,0.18)",
+      bottomColor: "rgba(148,163,184,0.02)",
+      lineWidth: 1,
+      lastValueVisible: false,
+      priceLineVisible: false
+    });
+
+    chartRef.current = chart;
+    candleSeriesRef.current = candleSeries;
+    ghostLineRef.current = ghostLine;
+    ghostAreaRef.current = ghostArea;
+
+    const resize = () => {
+      chart.applyOptions({
+        width: container.clientWidth,
+        height: container.clientHeight
+      });
+    };
+
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(container);
+
+    return () => {
+      resizeObserver.disconnect();
+      supportLineRef.current = null;
+      resistanceLineRef.current = null;
+      candleSeriesRef.current = null;
+      ghostLineRef.current = null;
+      ghostAreaRef.current = null;
+      chartRef.current = null;
+      chart.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    const candleSeries = candleSeriesRef.current;
+    const ghostLine = ghostLineRef.current;
+    const ghostArea = ghostAreaRef.current;
+    if (!chart || !candleSeries || !ghostLine || !ghostArea) {
+      return;
+    }
+
+    candleSeries.setData(candles);
+    ghostLine.setData(ghostSeries);
+    ghostArea.setData(
+      ghostSeries.map((point) => ({
+        time: point.time,
+        value: point.value
+      })) as AreaData<UTCTimestamp>[]
+    );
+
+    if (supportLineRef.current) {
+      candleSeries.removePriceLine(supportLineRef.current);
+      supportLineRef.current = null;
+    }
+    if (resistanceLineRef.current) {
+      candleSeries.removePriceLine(resistanceLineRef.current);
+      resistanceLineRef.current = null;
+    }
+
+    if (snapshot.technical.support > 0) {
+      supportLineRef.current = candleSeries.createPriceLine({
+        price: snapshot.technical.support,
+        color: "rgba(16,185,129,0.85)",
+        lineWidth: 2,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "S"
+      });
+    }
+    if (snapshot.technical.resistance > 0) {
+      resistanceLineRef.current = candleSeries.createPriceLine({
+        price: snapshot.technical.resistance,
+        color: "rgba(56,189,248,0.9)",
+        lineWidth: 2,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "R"
+      });
+    }
+
+    chart.timeScale().fitContent();
+  }, [candles, ghostSeries, snapshot.technical.resistance, snapshot.technical.support]);
+
+  return (
+    <div className="signal-grid relative h-full overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950/65 p-3">
+      <div ref={containerRef} className="h-full w-full" />
+
+      <div className="pointer-events-none absolute left-3 top-3 flex max-w-[calc(100%-92px)] flex-wrap items-center gap-2 text-[11px]">
+        <span className="max-w-[160px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
+          패턴 {patternClassKo(snapshot.pattern.klass)}
+        </span>
+        <span className="max-w-[160px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
+          공급원 {sourceKo(health?.zone3.source)}
+        </span>
+        <span className="max-w-[140px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
+          벡터 {health?.zone3.vectorDim ?? "-"}차원
+        </span>
+        <span className="max-w-[140px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
+          급증 {snapshot.technical.spikeRatio.toFixed(1)}%
+        </span>
+      </div>
+
+      <div className="pointer-events-none absolute inset-x-3 bottom-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+        <div className="min-w-0 rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200 sm:max-w-[58%]">
+          <p className="truncate">
+            지지선 {snapshot.technical.support.toLocaleString()} / 저항선 {snapshot.technical.resistance.toLocaleString()}
+          </p>
+        </div>
+        <div className="min-w-0 rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200 sm:max-w-[42%]">
+          <p className="truncate text-right">
+            {viewMode === "1m" ? "1분 차트" : "3분 차트"} | 틱 {health?.tickCount ?? "-"} | 현재가 {snapshot.tick.price.toLocaleString()}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export function CenterPanel({ snapshot, health, priceSeries, brainLogs }: CenterPanelProps) {
   const [viewMode, setViewMode] = useState<ViewMode>("1m");
 
-  const width = 860;
-  const height = 290;
-
-  const candles = useMemo(() => buildCandles(priceSeries, viewMode), [priceSeries, viewMode]);
-
-  const allPrices = candles.flatMap((candle) => [candle.high, candle.low]);
-  const minPrice = allPrices.length > 0 ? Math.min(...allPrices) : snapshot.tick.price * 0.98;
-  const maxPrice = allPrices.length > 0 ? Math.max(...allPrices) : snapshot.tick.price * 1.02;
-  const midPrice = (minPrice + maxPrice) / 2;
-
-  const candleGap = width / Math.max(1, candles.length);
-  const bodyWidth = Math.max(4, candleGap * 0.55);
-
-  const supportY = toY(snapshot.technical.support, minPrice, maxPrice, height);
-  const resistanceY = toY(snapshot.technical.resistance, minPrice, maxPrice, height);
-  const patternGhost = ghostPath(snapshot.pattern.klass, width, height);
   const madnessGauge = gaugeGradient(snapshot.madness.score);
-
-  const latestPrice = priceSeries[priceSeries.length - 1] ?? snapshot.tick.price;
-  const prevPrice = priceSeries[priceSeries.length - 2] ?? latestPrice;
-  const lastPriceUp = latestPrice >= prevPrice;
-  const lastPriceY = toY(latestPrice, minPrice, maxPrice, height);
 
   const madnessLabel =
     snapshot.madness.stage === "STAGE_3"
@@ -144,8 +373,8 @@ export function CenterPanel({ snapshot, health, priceSeries, brainLogs }: Center
     <div className="grid h-full min-w-0 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
       <Panel
         title="전술 차트 (존 1 + 존 3)"
-        subtitle="실시간 캔들 / 지지·저항 / 패턴 고스트 오버레이"
-        className="h-full min-w-0"
+        subtitle="lightweight-charts 캔들 / 지지·저항 Price Line / 패턴 고스트 오버레이"
+        className="min-w-0"
         rightSlot={
           <div className="flex flex-wrap items-center justify-end gap-2 text-[11px]">
             <div className="flex items-center gap-1 rounded-full border border-slate-700/80 bg-slate-900/80 p-1">
@@ -177,107 +406,8 @@ export function CenterPanel({ snapshot, health, priceSeries, brainLogs }: Center
           </div>
         }
       >
-        <div className="signal-grid relative h-full overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950/65 p-3">
-          <svg viewBox={`0 0 ${width} ${height}`} className="h-full w-full">
-            {[0.2, 0.4, 0.6, 0.8].map((ratio) => {
-              const y = height * ratio;
-              return <line key={ratio} x1="0" y1={y} x2={width} y2={y} stroke="rgba(148,163,184,0.16)" strokeWidth="1" />;
-            })}
-
-            <line x1="0" y1={supportY} x2={width} y2={supportY} stroke="#34d399" strokeDasharray="7 7" strokeOpacity="0.9" />
-            <line
-              x1="0"
-              y1={resistanceY}
-              x2={width}
-              y2={resistanceY}
-              stroke="#38bdf8"
-              strokeDasharray="7 7"
-              strokeOpacity="0.9"
-            />
-
-            <line
-              x1="0"
-              y1={lastPriceY}
-              x2={width}
-              y2={lastPriceY}
-              stroke={lastPriceUp ? "#f87171" : "#60a5fa"}
-              strokeDasharray="3 5"
-              strokeOpacity="0.85"
-            />
-
-            <path d={patternGhost} fill="none" stroke="#cbd5e1" strokeWidth={1.5} strokeOpacity="0.36" />
-
-            {candles.map((candle, index) => {
-              const xCenter = candleGap * index + candleGap / 2;
-              const yOpen = toY(candle.open, minPrice, maxPrice, height);
-              const yClose = toY(candle.close, minPrice, maxPrice, height);
-              const yHigh = toY(candle.high, minPrice, maxPrice, height);
-              const yLow = toY(candle.low, minPrice, maxPrice, height);
-              const bullish = candle.close >= candle.open;
-              const top = Math.min(yOpen, yClose);
-              const bodyHeight = Math.max(2, Math.abs(yClose - yOpen));
-
-              return (
-                <g key={`${index}-${candle.open}-${candle.close}`}>
-                  <line
-                    x1={xCenter}
-                    y1={yHigh}
-                    x2={xCenter}
-                    y2={yLow}
-                    stroke={bullish ? "#f87171" : "#60a5fa"}
-                    strokeWidth="1.3"
-                    strokeOpacity="0.92"
-                  />
-                  <rect
-                    x={xCenter - bodyWidth / 2}
-                    y={top}
-                    width={bodyWidth}
-                    height={bodyHeight}
-                    rx="1.4"
-                    fill={bullish ? "rgba(248,113,113,0.88)" : "rgba(96,165,250,0.84)"}
-                  />
-                </g>
-              );
-            })}
-
-            <text x={width - 6} y={Math.max(12, lastPriceY - 5)} textAnchor="end" fill={lastPriceUp ? "#fda4af" : "#93c5fd"} fontSize="11">
-              {fmtPrice(latestPrice)}
-            </text>
-          </svg>
-
-          <div className="absolute left-3 top-3 flex max-w-[calc(100%-92px)] flex-wrap items-center gap-2 text-[11px]">
-            <span className="max-w-[160px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
-              패턴 {patternClassKo(snapshot.pattern.klass)}
-            </span>
-            <span className="max-w-[160px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
-              공급원 {sourceKo(health?.zone3.source)}
-            </span>
-            <span className="max-w-[140px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
-              벡터 {health?.zone3.vectorDim ?? "-"}차원
-            </span>
-            <span className="max-w-[140px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
-              급증 {snapshot.technical.spikeRatio.toFixed(1)}%
-            </span>
-          </div>
-
-          <div className="pointer-events-none absolute right-3 top-10 flex h-[calc(100%-56px)] flex-col justify-between text-[10px] text-slate-400">
-            <span>{fmtPrice(maxPrice)}</span>
-            <span>{fmtPrice(midPrice)}</span>
-            <span>{fmtPrice(minPrice)}</span>
-          </div>
-
-          <div className="absolute inset-x-3 bottom-3 flex flex-wrap items-center justify-between gap-2 text-xs">
-            <div className="min-w-0 rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200 sm:max-w-[58%]">
-              <p className="truncate">
-                지지선 {snapshot.technical.support.toLocaleString()} / 저항선 {snapshot.technical.resistance.toLocaleString()}
-              </p>
-            </div>
-            <div className="min-w-0 rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200 sm:max-w-[42%]">
-              <p className="truncate text-right">
-                {viewMode === "1m" ? "1분 차트" : "3분 차트"} | 틱 {health?.tickCount ?? "-"} | 현재가 {snapshot.tick.price.toLocaleString()}
-              </p>
-            </div>
-          </div>
+        <div className="h-[420px] min-h-[360px] w-full md:h-[500px]">
+          <TacticalChart snapshot={snapshot} health={health} priceSeries={priceSeries} viewMode={viewMode} />
         </div>
       </Panel>
 

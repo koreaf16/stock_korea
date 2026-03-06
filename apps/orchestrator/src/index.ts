@@ -8,9 +8,11 @@ import { Server } from "socket.io";
 
 import { createOraclePersistence } from "./db/oracle-persistence.js";
 import { applyKillSwitch, applyManualOrder, initRuntime, stepRuntime } from "./pipeline.js";
+import { attachZone3MineRoutes } from "./routes/zone3-mine.js";
 import { resolveSymbolNames } from "./symbol-name-resolver.js";
 import type { RuntimeState } from "./state/store.js";
 import { createTelegramChannelManager } from "./zones/zone0/telegram-manager.js";
+import { createZone3MinerManager } from "./zones/zone3/miner-manager.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -23,6 +25,9 @@ const io = new Server(server, {
 let runtime = initRuntime();
 const telegramChannelManager = createTelegramChannelManager();
 const oraclePersistence = createOraclePersistence();
+const zone3MinerManager = createZone3MinerManager((event) => {
+  io.emit(SOCKET_EVENTS.ZONE3_MINING, event);
+});
 const port = Number(process.env.ORCHESTRATOR_PORT ?? 5001);
 const LLM_HEARTBEAT_MS = Math.max(3_000, Number(process.env.ZONE5_LLM_HEARTBEAT_MS ?? 10_000));
 const HEARTBEAT_TIMEOUT_MS = Math.max(500, Number(process.env.NETWORK_HEARTBEAT_TIMEOUT_MS ?? 1_500));
@@ -157,6 +162,7 @@ app.get("/api/zone2/state", (_req, res) => {
 app.get("/api/zone3/state", (_req, res) => {
   res.json(runtime.zone3.getStateSnapshot());
 });
+attachZone3MineRoutes(app, { zone3MinerManager });
 
 app.get("/api/zone4/state", (_req, res) => {
   res.json(runtime.zone4.getStateSnapshot());
@@ -343,6 +349,13 @@ io.on("connection", (socket) => {
   socket.emit(SOCKET_EVENTS.INIT, {
     type: "SNAPSHOT",
     payload: runtime.snapshot
+  });
+  socket.emit(SOCKET_EVENTS.ZONE3_MINING, {
+    type: "status",
+    timestamp: new Date().toISOString(),
+    running: zone3MinerManager.getStatus().running,
+    progress: zone3MinerManager.getStatus().progress,
+    message: zone3MinerManager.getStatus().lastMessage
   });
 
   socket.on(SOCKET_EVENTS.COMMAND_KILL_SWITCH, (payload: { enabled: boolean }) => {
@@ -557,6 +570,8 @@ async function shutdown(): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[orchestrator] oracle persistence stop failed: ${message}`);
   }
+
+  zone3MinerManager.stopMining();
 
   server.close(() => {
     process.exit(0);

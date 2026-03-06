@@ -28,6 +28,7 @@ import { Panel } from "./panel";
 
 const ORCHESTRATOR_URL = process.env.NEXT_PUBLIC_ORCHESTRATOR_URL ?? "http://localhost:5001";
 const POLL_MS = 3000;
+const ZONE3_MINE_POLL_MS = 5000;
 
 const ZONE_TITLE: Record<ZoneId, string> = {
   "0": "Raw Ingestion",
@@ -110,9 +111,24 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
   const brainLogs = useDashboardStore((state) => state.brainLogs);
   const newsFeed = useDashboardStore((state) => state.newsBoardFeed);
   const telegramFeed = useDashboardStore((state) => state.telegramFeed);
+  const zone3Mining = useDashboardStore((state) => state.zone3Mining);
+  const clearZone3MiningLogs = useDashboardStore((state) => state.clearZone3MiningLogs);
 
   const [reloadKey, setReloadKey] = useState(0);
   const [apiState, setApiState] = useState<ApiState>({ loading: true, error: null, payload: null, fetchedAt: null });
+  const [zone3StartDate, setZone3StartDate] = useState(() => toYmd(new Date(Date.now() - 1000 * 60 * 60 * 24 * 365 * 2)));
+  const [zone3EndDate, setZone3EndDate] = useState(() => toYmd(new Date()));
+  const [zone3Symbols, setZone3Symbols] = useState("005930,000660,035420");
+  const [zone3Busy, setZone3Busy] = useState(false);
+  const [zone3Error, setZone3Error] = useState<string | null>(null);
+  const [zone3Stats, setZone3Stats] = useState<{
+    totalPatterns: number;
+    classA: number;
+    classC: number;
+    classARatio: number;
+    classCRatio: number;
+    lastUpdatedAt: string | null;
+  } | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -159,6 +175,68 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
     };
   }, [reloadKey, zoneId]);
 
+  useEffect(() => {
+    if (zoneId !== "3") {
+      return;
+    }
+
+    let alive = true;
+
+    const loadZone3Meta = async () => {
+      try {
+        const [statsResponse, statusResponse] = await Promise.all([
+          fetch(`${ORCHESTRATOR_URL}/api/zone3/mine/stats`, {
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store"
+          }),
+          fetch(`${ORCHESTRATOR_URL}/api/zone3/mine/status`, {
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store"
+          })
+        ]);
+
+        if (!alive) {
+          return;
+        }
+
+        if (statsResponse.ok) {
+          const payload = (await statsResponse.json()) as { stats?: typeof zone3Stats };
+          if (payload?.stats) {
+            setZone3Stats(payload.stats);
+          }
+        }
+
+        if (statusResponse.ok) {
+          const payload = (await statusResponse.json()) as {
+            status?: { params?: { startDate?: string; endDate?: string; symbols?: string[] } };
+          };
+          const params = payload.status?.params;
+          if (params?.startDate) {
+            setZone3StartDate(params.startDate);
+          }
+          if (params?.endDate) {
+            setZone3EndDate(params.endDate);
+          }
+          if (params?.symbols && params.symbols.length > 0) {
+            setZone3Symbols(params.symbols.join(","));
+          }
+        }
+      } catch {
+        // noop
+      }
+    };
+
+    void loadZone3Meta();
+    const timer = setInterval(loadZone3Meta, ZONE3_MINE_POLL_MS);
+
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [zoneId]);
+
   const zoneIndex = ZONE_IDS.indexOf(zoneId);
   const prevZone = zoneIndex > 0 ? ZONE_IDS[zoneIndex - 1] ?? null : null;
   const nextZone = zoneIndex < ZONE_IDS.length - 1 ? ZONE_IDS[zoneIndex + 1] ?? null : null;
@@ -167,6 +245,51 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
 
   const rows = useMemo(() => buildRows(zoneId, snapshot, health, apiState.payload, zone0Raw), [zoneId, snapshot, health, apiState.payload, zone0Raw]);
   const logs = useMemo(() => buildLogs(zoneId, snapshot, tickLogs, brainLogs, newsFeed, telegramFeed), [zoneId, snapshot, tickLogs, brainLogs, newsFeed, telegramFeed]);
+
+  const zone3ClassAText = useMemo(() => {
+    const ratio = zone3Stats?.classARatio ?? zone3Mining.stats?.classARatio ?? 0;
+    return `${(ratio * 100).toFixed(1)}%`;
+  }, [zone3Mining.stats?.classARatio, zone3Stats?.classARatio]);
+
+  const zone3ClassCText = useMemo(() => {
+    const ratio = zone3Stats?.classCRatio ?? zone3Mining.stats?.classCRatio ?? 0;
+    return `${(ratio * 100).toFixed(1)}%`;
+  }, [zone3Mining.stats?.classCRatio, zone3Stats?.classCRatio]);
+
+  const runZone3Mining = async () => {
+    if (zoneId !== "3") {
+      return;
+    }
+
+    setZone3Busy(true);
+    setZone3Error(null);
+    try {
+      const symbols = zone3Symbols
+        .split(",")
+        .map((token) => token.trim())
+        .filter(Boolean);
+      const response = await fetch(`${ORCHESTRATOR_URL}/api/zone3/mine`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          startDate: zone3StartDate,
+          endDate: zone3EndDate,
+          symbols
+        })
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({ error: "요청 실패" }))) as { error?: string };
+        throw new Error(payload.error ?? `요청 실패 (${response.status})`);
+      }
+      setReloadKey((value) => value + 1);
+    } catch (error) {
+      setZone3Error(error instanceof Error ? error.message : "마이닝 시작 실패");
+    } finally {
+      setZone3Busy(false);
+    }
+  };
 
   return (
     <main className="min-h-screen bg-slate-950 p-2 text-slate-100">
@@ -217,6 +340,109 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
         {apiState.error ? <p className="mt-2 text-xs text-rose-300">{apiState.error}</p> : null}
       </header>
 
+      {zoneId === "3" ? (
+        <section className="mb-3 grid gap-3 xl:grid-cols-[1.2fr_1fr]">
+          <Panel title="Zone3 Pattern Mining Control" subtitle="과거 이벤트 패턴 벡터화 + Oracle 26ai 적재" className="h-full">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <div className="rounded-lg border border-slate-700 bg-slate-950/70 p-2">
+                <p className="text-[11px] text-slate-400">총 패턴 수</p>
+                <p className="mt-1 text-sm font-semibold text-cyan-200">
+                  {num((zone3Stats?.totalPatterns ?? zone3Mining.stats?.totalPatterns) as number)}
+                </p>
+              </div>
+              <div className="rounded-lg border border-slate-700 bg-slate-950/70 p-2">
+                <p className="text-[11px] text-slate-400">최근 업데이트</p>
+                <p className="mt-1 text-sm font-semibold text-slate-100">
+                  {ts(zone3Stats?.lastUpdatedAt ?? zone3Mining.stats?.lastUpdatedAt ?? null)}
+                </p>
+              </div>
+              <div className="rounded-lg border border-slate-700 bg-slate-950/70 p-2">
+                <p className="text-[11px] text-slate-400">CLASS_A 비율</p>
+                <p className="mt-1 text-sm font-semibold text-rose-300">
+                  {num((zone3Stats?.classA ?? zone3Mining.stats?.classA) as number)}건 ({zone3ClassAText})
+                </p>
+              </div>
+              <div className="rounded-lg border border-slate-700 bg-slate-950/70 p-2">
+                <p className="text-[11px] text-slate-400">CLASS_C 비율</p>
+                <p className="mt-1 text-sm font-semibold text-blue-300">
+                  {num((zone3Stats?.classC ?? zone3Mining.stats?.classC) as number)}건 ({zone3ClassCText})
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-2 md:grid-cols-3">
+              <label className="text-xs text-slate-300">
+                시작일
+                <input
+                  type="date"
+                  value={zone3StartDate}
+                  onChange={(e) => setZone3StartDate(e.target.value)}
+                  className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-slate-100"
+                />
+              </label>
+              <label className="text-xs text-slate-300">
+                종료일
+                <input
+                  type="date"
+                  value={zone3EndDate}
+                  onChange={(e) => setZone3EndDate(e.target.value)}
+                  className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-slate-100"
+                />
+              </label>
+              <label className="text-xs text-slate-300">
+                종목코드 (CSV)
+                <input
+                  type="text"
+                  value={zone3Symbols}
+                  onChange={(e) => setZone3Symbols(e.target.value)}
+                  className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-slate-100"
+                  placeholder="005930,000660,035420"
+                />
+              </label>
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={zone3Busy || zone3Mining.running}
+                onClick={runZone3Mining}
+                className="rounded border border-cyan-500/50 bg-cyan-500/15 px-3 py-1.5 text-xs font-semibold text-cyan-200 disabled:opacity-50"
+              >
+                {zone3Mining.running ? "마이닝 실행 중..." : "과거 패턴 마이닝 시작"}
+              </button>
+              <button
+                type="button"
+                onClick={clearZone3MiningLogs}
+                className="rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs text-slate-300"
+              >
+                로그 비우기
+              </button>
+              <span className="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[11px] text-slate-300">
+                진행률 {zone3Mining.progress}%
+              </span>
+              <span className={`rounded-full border px-2 py-0.5 text-[11px] ${zone3Mining.running ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-200" : "border-slate-700 bg-slate-900 text-slate-300"}`}>
+                {zone3Mining.running ? "RUNNING" : "IDLE"}
+              </span>
+            </div>
+            {zone3Error ? <p className="mt-2 text-xs text-rose-300">{zone3Error}</p> : null}
+          </Panel>
+
+          <Panel title="Mining Terminal" subtitle="실시간 진행률/상태 로그 (WebSocket)" className="h-full">
+            <div className="terminal-font h-[310px] overflow-auto rounded-lg border border-slate-700/60 bg-slate-950/80 p-2 text-xs text-emerald-300">
+              {zone3Mining.logs.length === 0 ? (
+                <p className="text-slate-500">Zone3 마이닝 로그 대기 중...</p>
+              ) : (
+                zone3Mining.logs.map((line) => (
+                  <p key={line.id} className="leading-relaxed">
+                    {line.text}
+                  </p>
+                ))
+              )}
+            </div>
+          </Panel>
+        </section>
+      ) : null}
+
       <section className="grid gap-3 xl:grid-cols-[1.2fr_1fr]">
         <Panel title="Live Metrics" subtitle="현재 연결된 실데이터 기반 지표" className="h-full">
           <div className="grid gap-2 sm:grid-cols-2">
@@ -246,6 +472,13 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
       </footer>
     </main>
   );
+}
+
+function toYmd(date: Date): string {
+  const y = date.getFullYear();
+  const m = `${date.getMonth() + 1}`.padStart(2, "0");
+  const d = `${date.getDate()}`.padStart(2, "0");
+  return `${y}-${m}-${d}`;
 }
 
 function buildRows(

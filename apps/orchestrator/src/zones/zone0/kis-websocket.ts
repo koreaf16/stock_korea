@@ -1,4 +1,5 @@
 import axios from "axios";
+import { createDecipheriv } from "node:crypto";
 import WebSocket from "ws";
 
 import { runWithRetry } from "./http-retry.js";
@@ -58,6 +59,11 @@ interface ApprovalResponse {
   approval_key?: string;
 }
 
+interface RealtimeCryptoKey {
+  key: string;
+  iv: string;
+}
+
 export class KisWebSocketClient {
   private readonly env: KisEnv;
   private readonly reconnectDelayMs: number;
@@ -70,6 +76,8 @@ export class KisWebSocketClient {
   private connected = false;
   private approvalKey: string | null = null;
   private targetSymbols: string[];
+  private readonly realtimeCryptoByTrId = new Map<string, RealtimeCryptoKey>();
+  private readonly realtimeCryptoByTrSymbol = new Map<string, RealtimeCryptoKey>();
   private readonly onConnectionStateChange?: (connected: boolean) => void;
   private readonly onTick?: (tick: KisExecutionTick) => void;
   private readonly onOrderBook?: (orderBook: KisOrderBook) => void;
@@ -111,6 +119,8 @@ export class KisWebSocketClient {
     }
 
     this.approvalKey = null;
+    this.realtimeCryptoByTrId.clear();
+    this.realtimeCryptoByTrSymbol.clear();
 
     if (this.ws) {
       const socket = this.ws;
@@ -265,6 +275,8 @@ export class KisWebSocketClient {
         }
         this.setConnected(false);
         this.approvalKey = null;
+        this.realtimeCryptoByTrId.clear();
+        this.realtimeCryptoByTrSymbol.clear();
         if (!this.stopped) {
           this.scheduleReconnect("socket-close");
         }
@@ -343,16 +355,23 @@ export class KisWebSocketClient {
       return;
     }
 
-    const trId = pipe[1];
+    const trId = pipe[1] ?? "";
     const payload = pipe[3];
-    if (!payload) {
+    if (!trId || !payload) {
+      return;
+    }
+
+    const dataType = pipe[0];
+    const encrypted = dataType === "1";
+    const decryptedPayload = encrypted ? this.decryptRealtimePayload(trId, payload) : payload;
+    if (!decryptedPayload) {
       return;
     }
 
     const fallbackSymbol = this.targetSymbols[0] ?? DEFAULT_SYMBOL;
 
     if (trId === EXECUTION_TR_ID) {
-      const tick = parseExecutionPayload(payload, text, fallbackSymbol);
+      const tick = parseExecutionPayload(decryptedPayload, text, fallbackSymbol);
       if (!tick) {
         return;
       }
@@ -365,7 +384,7 @@ export class KisWebSocketClient {
     }
 
     if (trId === ORDERBOOK_TR_ID) {
-      const orderBook = parseOrderBookPayload(payload, text, fallbackSymbol);
+      const orderBook = parseOrderBookPayload(decryptedPayload, text, fallbackSymbol);
       if (!orderBook) {
         return;
       }
@@ -380,10 +399,61 @@ export class KisWebSocketClient {
   private handleControlJson(text: string): void {
     try {
       const parsed: unknown = JSON.parse(text);
+      this.maybeStoreRealtimeCrypto(parsed);
       this.onControlMessage?.(parsed);
       this.logger.debug(`[KIS][WS][CTRL] ${text}`);
     } catch {
       this.logger.warn(`[KIS][WS][CTRL] JSON 파싱 실패: ${text}`);
+    }
+  }
+
+  private maybeStoreRealtimeCrypto(payload: unknown): void {
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+
+    const root = payload as Record<string, unknown>;
+    const header = root.header as Record<string, unknown> | undefined;
+    const body = root.body as Record<string, unknown> | undefined;
+    const output = body?.output as Record<string, unknown> | undefined;
+
+    const trId = String(header?.tr_id ?? "").trim();
+    const trKey = sanitizeSymbol(String(header?.tr_key ?? "").trim());
+    const key = String(output?.key ?? "").trim();
+    const iv = String(output?.iv ?? "").trim();
+    if (!trId || !key || !iv) {
+      return;
+    }
+
+    const crypto: RealtimeCryptoKey = { key, iv };
+    this.realtimeCryptoByTrId.set(trId, crypto);
+    this.realtimeCryptoByTrSymbol.set(`${trId}:${trKey}`, crypto);
+  }
+
+  private decryptRealtimePayload(trId: string, encryptedPayload: string): string | null {
+    const symbolKeys = this.targetSymbols.map((symbol) => `${trId}:${symbol}`);
+    let crypto: RealtimeCryptoKey | undefined;
+    for (const candidate of symbolKeys) {
+      const found = this.realtimeCryptoByTrSymbol.get(candidate);
+      if (found) {
+        crypto = found;
+        break;
+      }
+    }
+    if (!crypto) {
+      crypto = this.realtimeCryptoByTrId.get(trId);
+    }
+    if (!crypto) {
+      this.logger.warn(`[KIS][WS] 암호화 프레임 키 없음: tr_id=${trId}`);
+      return null;
+    }
+
+    try {
+      return decryptAes256CbcBase64(encryptedPayload, crypto.key, crypto.iv);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`[KIS][WS] 암호화 프레임 복호화 실패(tr_id=${trId}): ${message}`);
+      return null;
     }
   }
 
@@ -598,4 +668,14 @@ function toUtf8(rawData: WebSocket.RawData): string {
     return Buffer.from(new Uint8Array(rawData)).toString("utf8");
   }
   return Buffer.from(rawData.buffer, rawData.byteOffset, rawData.byteLength).toString("utf8");
+}
+
+function decryptAes256CbcBase64(cipherText: string, key: string, iv: string): string {
+  const algorithm = "aes-256-cbc";
+  const keyBuf = Buffer.from(key, "utf8");
+  const ivBuf = Buffer.from(iv, "utf8");
+  const decipher = createDecipheriv(algorithm, keyBuf, ivBuf);
+  let decoded = decipher.update(cipherText, "base64", "utf8");
+  decoded += decipher.final("utf8");
+  return decoded.trim();
 }
