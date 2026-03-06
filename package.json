@@ -1,0 +1,23 @@
+{
+  "name": "stock-korea",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "dotenv -e .env.local -- concurrently \"npm run dev -w @stock/orchestrator\" \"npm run dev -w @stock/dashboard\"",
+    "dev:orchestrator": "dotenv -e .env.local -- npm run dev -w @stock/orchestrator",
+    "dev:dashboard": "dotenv -e .env.local -- npm run dev -w @stock/dashboard",
+    "build": "npm run build -w @stock/contracts && npm run build -w @stock/orchestrator && npm run build -w @stock/dashboard",
+    "typecheck": "npm run build -w @stock/contracts && npm run typecheck -w @stock/orchestrator && npm run typecheck -w @stock/dashboard",
+    "db:init": "pwsh -File scripts/db-init.ps1 -EnvFile .env.local -SqlFile db/oracle/init_schema.sql",
+    "verify:zones": "pwsh -File scripts/verify-zones.ps1 -StartLocal"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0",
+    "dotenv-cli": "^7.4.2",
+    "typescript": "^5.8.2"
+  }
+}
