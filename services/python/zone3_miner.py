@@ -35,8 +35,10 @@ BACKOFF_MAX_SEC = max(BACKOFF_MIN_SEC, float(os.getenv("ZONE3_MINE_BACKOFF_MAX_S
 EVENT_UP_PCT = 15.0
 EVENT_DOWN_PCT = -10.0
 WINDOW_MINUTES = 30
-BATCH_SIZE = max(1, int(os.getenv("ZONE3_MINE_BATCH_SIZE", "50")))
-STAGING_DIR = Path(os.getenv("ZONE3_PATTERN_STAGING_DIR", "data/zone3_patterns"))
+UPSERT_BATCH_SIZE = max(1, int(os.getenv("ZONE3_UPSERT_BATCH_SIZE", "100")))
+RAW_BASE_DIR = Path(os.getenv("ZONE3_RAW_BASE_DIR", "data/zone3/raw"))
+RAW_DAILY_DIR = RAW_BASE_DIR / "daily"
+RAW_MINUTE_DIR = RAW_BASE_DIR / "minute"
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,81 @@ def emit(event_type: str, message: str, **extra: Any) -> None:
 def to_symbol(raw: Any) -> str:
     digits = "".join(ch for ch in str(raw or "").strip() if ch.isdigit())
     return digits[:6].zfill(6) if digits else ""
+
+
+def ensure_raw_dirs() -> None:
+    RAW_DAILY_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_MINUTE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def daily_raw_path(symbol: str) -> Path:
+    return RAW_DAILY_DIR / f"{symbol}.csv"
+
+
+def minute_raw_path(symbol: str, event_date: dt.date) -> Path:
+    return RAW_MINUTE_DIR / symbol / f"{event_date.strftime('%Y%m%d')}.csv"
+
+
+def save_daily_raw(symbol: str, df: pd.DataFrame) -> None:
+    path = daily_raw_path(symbol)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.date
+    out = out.dropna(subset=["Date"])
+    out = out[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    out = out.sort_values("Date")
+    out = out.drop_duplicates(subset=["Date"], keep="first")
+    out.to_csv(path, index=False, encoding="utf-8")
+
+
+def load_daily_raw(symbol: str) -> pd.DataFrame:
+    path = daily_raw_path(symbol)
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        emit("log", f"[RAW] daily read failed symbol={symbol}: {exc}", level="warn")
+        return pd.DataFrame()
+
+    required = ["Date", "Open", "High", "Low", "Close", "Volume"]
+    for col in required:
+        if col not in df.columns:
+            df[col] = 0.0 if col != "Date" else ""
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df = df.dropna(subset=["Date"])
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    return df[required].sort_values("Date").drop_duplicates(subset=["Date"], keep="first")
+
+
+def save_minute_raw(symbol: str, event_date: dt.date, df: pd.DataFrame) -> None:
+    path = minute_raw_path(symbol, event_date)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = preprocess_minute_df(df)
+    if out.empty:
+        return
+    out = out[["timestamp", "open", "high", "low", "close", "volume"]]
+    out.to_csv(path, index=False, encoding="utf-8")
+
+
+def load_minute_raw(symbol: str, event_date: dt.date) -> pd.DataFrame:
+    path = minute_raw_path(symbol, event_date)
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        emit("log", f"[RAW] minute read failed symbol={symbol} date={event_date}: {exc}", level="warn")
+        return pd.DataFrame()
+
+    required = ["timestamp", "open", "high", "low", "close", "volume"]
+    for col in required:
+        if col not in df.columns:
+            df[col] = 0.0 if col != "timestamp" else ""
+    return preprocess_minute_df(df)
 
 
 class HttpClient:
@@ -774,84 +851,96 @@ def iter_symbols(listing_df: pd.DataFrame, limit: int) -> Iterable[tuple[int, in
         yield idx, total, symbol, name
 
 
-def run() -> None:
-    parser = argparse.ArgumentParser(description="Zone3 pattern library miner")
-    parser.add_argument("--vector-dim", type=int, default=ZONE3_VECTOR_DIM)
-    parser.add_argument("--symbol-limit", type=int, default=int(os.getenv("ZONE3_MINE_SYMBOL_LIMIT", "2000")))
-    parser.add_argument("--max-events-per-symbol", type=int, default=int(os.getenv("ZONE3_MINE_MAX_EVENTS_PER_SYMBOL", "6")))
-    parser.add_argument("--exclude-keywords", default="ETF,ETN,스팩,SPAC,우선주,우B,우C,리츠")
-    args = parser.parse_args()
+def load_or_fetch_daily(symbol: str, start_date: dt.date, end_date: dt.date, kis: KisClient) -> pd.DataFrame:
+    cached = load_daily_raw(symbol)
+    if not cached.empty:
+        return cached
 
-    today = dt.date.today()
-    start_date = today - dt.timedelta(days=365 * 2)
-    end_date = today
-    staging_dir = ensure_staging_dir(STAGING_DIR)
+    if kis.enabled:
+        df = kis.fetch_daily_df(symbol, start_date, end_date)
+        if not df.empty:
+            save_daily_raw(symbol, df)
+            emit("log", f"[RAW] daily saved symbol={symbol} path={daily_raw_path(symbol)}", level="info")
+            return load_daily_raw(symbol)
 
-    exclude_keywords = [token.strip() for token in str(args.exclude_keywords).split(",") if token.strip()]
-    listing = get_market_symbols(exclude_keywords=exclude_keywords)
-    if listing.empty:
-        raise RuntimeError("종목 마스터 리스트 수집 실패(FDR/PYKRX)")
-    try:
-        existing_symbols = fetch_existing_symbols_from_db()
-    except Exception as exc:
-        emit("log", f"[DB] 기존 적재 종목 조회 실패, 전체 스캔으로 진행: {exc}", level="warn")
-        existing_symbols = set()
+    df = fetch_daily_df_with_fdr(symbol, start_date, end_date)
+    if not df.empty:
+        save_daily_raw(symbol, df)
+        emit("log", f"[RAW] daily saved symbol={symbol} path={daily_raw_path(symbol)}", level="info")
+        return load_daily_raw(symbol)
 
-    staged_replayed = 0
-    try:
-        staged_replayed = replay_local_staged_records(staging_dir, BATCH_SIZE)
-        if staged_replayed > 0:
-            emit("log", f"[LOCAL] staged records replay complete merged={staged_replayed}", level="info")
-    except Exception as exc:
-        emit("log", f"[LOCAL] staged records replay failed: {exc}", level="warn")
+    return pd.DataFrame()
 
-    if existing_symbols:
-        listing = listing[~listing["Symbol"].isin(existing_symbols)].reset_index(drop=True)
 
-    if listing.empty:
-        emit(
-            "completed",
-            "이미 모든 종목이 적재되어 있어 작업할 대상이 없습니다.",
-            running=False,
-            progress=100,
-            inserted=0,
-        )
-        return
+def load_or_fetch_minute(symbol: str, event_date: dt.date, kis: KisClient) -> pd.DataFrame:
+    cached = load_minute_raw(symbol, event_date)
+    if not cached.empty:
+        return cached
 
-    http = HttpClient()
-    kis = KisClient(http=http)
+    if not kis.enabled:
+        return pd.DataFrame()
 
-    emit(
-        "status",
-        "Zone3 마이닝 시작",
-        running=True,
-        progress=0,
-        start_date=str(start_date),
-        end_date=str(end_date),
-        symbols_total=min(args.symbol_limit, len(listing)),
-        resume_skip_symbols=len(existing_symbols),
-        staged_replayed=staged_replayed,
-        batch_size=BATCH_SIZE,
-        staging_dir=str(staging_dir.resolve()),
-        kis_enabled=kis.enabled,
-    )
+    df = kis.fetch_event_day_minutes(symbol, event_date)
+    if df.empty:
+        return pd.DataFrame()
 
+    save_minute_raw(symbol, event_date, df)
+    emit("log", f"[RAW] minute saved symbol={symbol} date={event_date} path={minute_raw_path(symbol, event_date)}", level="info")
+    return load_minute_raw(symbol, event_date)
+
+
+def sync_raw_data(
+    *,
+    listing: pd.DataFrame,
+    kis: KisClient,
+    start_date: dt.date,
+    end_date: dt.date,
+    symbol_limit: int,
+    max_events_per_symbol: int,
+) -> None:
+    for idx, total, symbol, name in iter_symbols(listing, symbol_limit):
+        emit("log", f"[SYNC {idx}/{total}] {symbol} {name} raw 수집", level="info")
+
+        daily_df = load_or_fetch_daily(symbol, start_date, end_date, kis)
+        if daily_df.empty:
+            emit("log", f"[SYNC] {symbol} 일봉 수집 실패/없음", level="warn")
+            continue
+
+        events = extract_daily_events(symbol, daily_df)
+        if not events:
+            continue
+
+        events = sorted(events, key=lambda e: abs(e.pct_change), reverse=True)[: max(1, max_events_per_symbol)]
+        if not kis.enabled:
+            emit("log", f"[SYNC] {symbol} KIS 비활성화로 분봉 raw 수집 생략", level="warn")
+            continue
+
+        for event in events:
+            _ = load_or_fetch_minute(symbol, event.event_date, kis)
+
+
+def transform_and_upsert(
+    *,
+    listing: pd.DataFrame,
+    symbol_limit: int,
+    max_events_per_symbol: int,
+    vector_dim: int,
+) -> tuple[int, int, int, int]:
     records: list[PatternRecord] = []
-    total_buffered = 0
-    total_merged = staged_replayed
+    total_generated = 0
+    total_merged = 0
     class_a = 0
     class_c = 0
-    processed_symbols = 0
 
     def flush_batch(force: bool = False) -> None:
-        nonlocal total_merged, total_buffered
+        nonlocal total_merged
         if not records:
             return
-        if not force and len(records) < BATCH_SIZE:
+        if not force and len(records) < UPSERT_BATCH_SIZE:
             return
+
         merged = upsert_patterns(records)
         total_merged += merged
-        total_buffered += len(records)
         emit(
             "log",
             f"[DB] batch upsert requested={len(records)} merged={merged} total_merged={total_merged}",
@@ -859,58 +948,26 @@ def run() -> None:
         )
         records.clear()
 
-    for idx, total, symbol, name in iter_symbols(listing, args.symbol_limit):
-        processed_symbols += 1
-        emit("log", f"[{idx}/{total}] {symbol} {name} 일봉 이벤트 탐색", level="info")
+    for idx, total, symbol, name in iter_symbols(listing, symbol_limit):
+        emit("log", f"[TRANSFORM {idx}/{total}] {symbol} {name}", level="info")
 
-        # 1단계: 일봉으로 이벤트 날짜 탐색
-        if kis.enabled:
-            daily_df = kis.fetch_daily_df(symbol, start_date, end_date)
-            if daily_df.empty:
-                daily_df = fetch_daily_df_with_fdr(symbol, start_date, end_date)
-        else:
-            daily_df = fetch_daily_df_with_fdr(symbol, start_date, end_date)
-
+        daily_df = load_daily_raw(symbol)
         if daily_df.empty:
-            emit("log", f"[{symbol}] 일봉 데이터 없음, skip", level="warn")
-            progress = int((idx / max(1, total)) * 100)
-            emit("progress", f"{symbol} 처리 완료", progress=progress, processed_symbols=processed_symbols, records=len(records))
+            emit("log", f"[TRANSFORM] {symbol} 일봉 raw 없음, skip", level="warn")
             continue
 
         events = extract_daily_events(symbol, daily_df)
         if not events:
-            progress = int((idx / max(1, total)) * 100)
-            emit("progress", f"{symbol} 이벤트 없음", progress=progress, processed_symbols=processed_symbols, records=len(records))
             continue
 
-        # 이벤트 과다 시 상위 변동폭부터 처리
-        events = sorted(events, key=lambda e: abs(e.pct_change), reverse=True)[: max(1, args.max_events_per_symbol)]
+        events = sorted(events, key=lambda e: abs(e.pct_change), reverse=True)[: max(1, max_events_per_symbol)]
 
-        local_history_exists = has_local_record_for_symbol(staging_dir, symbol)
-        processed_today = was_symbol_processed_today(staging_dir, symbol, today)
-        if local_history_exists or processed_today:
-            reason = "로컬 파일 체크포인트 존재" if local_history_exists else "당일 처리 체크포인트 존재"
-            emit("log", f"[{symbol}] {reason}로 KIS 분봉 호출 생략, 이벤트 {len(events)}건 skip", level="warn")
-            mark_symbol_processed_today(staging_dir, symbol, reason=reason, event_count=len(events))
-            progress = int((idx / max(1, total)) * 100)
-            emit("progress", f"{symbol} 처리 완료", progress=progress, processed_symbols=processed_symbols, records=len(records))
-            continue
-
-        if not kis.enabled:
-            emit("log", f"[{symbol}] KIS 비활성화로 분봉 수집 불가, 이벤트 {len(events)}건 skip", level="warn")
-            mark_symbol_processed_today(staging_dir, symbol, reason="KIS disabled", event_count=len(events))
-            progress = int((idx / max(1, total)) * 100)
-            emit("progress", f"{symbol} 처리 완료", progress=progress, processed_symbols=processed_symbols, records=len(records))
-            continue
-
-        # 2단계: 이벤트일 분봉 핀셋 수집 후 벡터화
         for event in events:
-            minute_df = kis.fetch_event_day_minutes(symbol, event.event_date)
+            minute_df = load_minute_raw(symbol, event.event_date)
             if minute_df.empty:
-                emit("log", f"[{symbol}] {event.event_date} 분봉 없음, skip", level="warn")
+                emit("log", f"[TRANSFORM] {symbol} {event.event_date} 분봉 raw 없음, skip", level="warn")
                 continue
 
-            minute_df = preprocess_minute_df(minute_df)
             start_idx = find_event_start_index(minute_df, event.klass)
             if start_idx <= 0:
                 continue
@@ -921,7 +978,7 @@ def run() -> None:
 
             event_row = minute_df.iloc[start_idx]
             event_ts = pd.to_datetime(event_row["timestamp"]).to_pydatetime()
-            vector = vectorize_ohlvc(window_df, args.vector_dim)
+            vector = vectorize_ohlvc(window_df, vector_dim)
             pattern_id = build_pattern_id(event.klass, symbol, event_ts)
 
             sample_json = json.dumps(
@@ -948,38 +1005,101 @@ def run() -> None:
                     sample_ohlvc_json=sample_json,
                 )
             )
+            total_generated += 1
             if event.klass == "CLASS_A":
                 class_a += 1
             elif event.klass == "CLASS_C":
                 class_c += 1
-            write_pattern_record_file(staging_dir, records[-1])
-            emit(
-                "log",
-                f"{symbol} {event.event_date} {event.klass} 벡터화 완료 pattern_id={pattern_id}",
-                level="info",
-            )
+
             flush_batch(force=False)
 
-        mark_symbol_processed_today(staging_dir, symbol, reason="processed", event_count=len(events))
-
-        progress = int((idx / max(1, total)) * 100)
-        emit("progress", f"{symbol} 처리 완료", progress=progress, processed_symbols=processed_symbols, records=len(records))
-
     flush_batch(force=True)
-    if total_buffered == 0 and staged_replayed == 0:
+    return total_generated, total_merged, class_a, class_c
+
+
+def run() -> None:
+    parser = argparse.ArgumentParser(description="Zone3 data-lake miner")
+    parser.add_argument("--vector-dim", type=int, default=ZONE3_VECTOR_DIM)
+    parser.add_argument("--symbol-limit", type=int, default=int(os.getenv("ZONE3_MINE_SYMBOL_LIMIT", "2000")))
+    parser.add_argument("--max-events-per-symbol", type=int, default=int(os.getenv("ZONE3_MINE_MAX_EVENTS_PER_SYMBOL", "6")))
+    parser.add_argument("--exclude-keywords", default="ETF,ETN,스팩,SPAC,우선주,우B,우C,리츠")
+    args = parser.parse_args()
+
+    ensure_raw_dirs()
+
+    today = dt.date.today()
+    start_date = today - dt.timedelta(days=365 * 2)
+    end_date = today
+
+    exclude_keywords = [token.strip() for token in str(args.exclude_keywords).split(",") if token.strip()]
+    listing = get_market_symbols(exclude_keywords=exclude_keywords)
+    if listing.empty:
+        raise RuntimeError("종목 마스터 리스트 수집 실패(FDR/PYKRX/KIND)")
+    try:
+        existing_symbols = fetch_existing_symbols_from_db()
+    except Exception as exc:
+        emit("log", f"[DB] 기존 적재 종목 조회 실패, 전체 스캔으로 진행: {exc}", level="warn")
+        existing_symbols = set()
+
+    if existing_symbols:
+        listing = listing[~listing["Symbol"].isin(existing_symbols)].reset_index(drop=True)
+
+    if listing.empty:
+        emit(
+            "completed",
+            "이미 모든 종목이 적재되어 있어 작업할 대상이 없습니다.",
+            running=False,
+            progress=100,
+            inserted=0,
+        )
+        return
+
+    http = HttpClient()
+    kis = KisClient(http=http)
+
+    emit(
+        "status",
+        "Zone3 마이닝 시작",
+        running=True,
+        progress=0,
+        start_date=str(start_date),
+        end_date=str(end_date),
+        symbols_total=min(args.symbol_limit, len(listing)),
+        resume_skip_symbols=len(existing_symbols),
+        raw_base_dir=str(RAW_BASE_DIR.resolve()),
+        upsert_batch_size=UPSERT_BATCH_SIZE,
+        kis_enabled=kis.enabled,
+    )
+
+    sync_raw_data(
+        listing=listing,
+        kis=kis,
+        start_date=start_date,
+        end_date=end_date,
+        symbol_limit=args.symbol_limit,
+        max_events_per_symbol=args.max_events_per_symbol,
+    )
+
+    generated, merged, class_a, class_c = transform_and_upsert(
+        listing=listing,
+        symbol_limit=args.symbol_limit,
+        max_events_per_symbol=args.max_events_per_symbol,
+        vector_dim=args.vector_dim,
+    )
+
+    if generated <= 0:
         emit("completed", "생성된 패턴이 없어 DB 적재를 건너뜀", running=False, progress=100, inserted=0)
         return
 
     emit(
         "completed",
-        f"Zone3 마이닝 완료 records={total_buffered} merged={total_merged}",
+        f"Zone3 마이닝 완료 records={generated} merged={merged}",
         running=False,
         progress=100,
-        processed=total_buffered,
-        inserted=total_merged,
+        processed=generated,
+        inserted=merged,
         class_a=class_a,
         class_c=class_c,
-        staged_replayed=staged_replayed,
     )
 
 
