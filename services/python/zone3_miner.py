@@ -13,8 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import numpy as np
-import oracledb
+try:
+    import numpy as np
+except ModuleNotFoundError:
+    np = None
+try:
+    import oracledb
+except ModuleNotFoundError:
+    oracledb = None
 import pandas as pd
 import requests
 try:
@@ -39,8 +45,8 @@ REQUEST_DELAY_SEC = max(0.2, float(os.getenv("ZONE3_MINE_REQUEST_DELAY_SEC", "0.
 RETRY_MAX_ATTEMPTS = max(2, int(os.getenv("ZONE3_MINE_RETRY_MAX_ATTEMPTS", "5")))
 BACKOFF_MIN_SEC = max(10.0, float(os.getenv("ZONE3_MINE_BACKOFF_MIN_SEC", "10")))
 BACKOFF_MAX_SEC = max(BACKOFF_MIN_SEC, float(os.getenv("ZONE3_MINE_BACKOFF_MAX_SEC", "30")))
-EVENT_UP_PCT = 15.0
-EVENT_DOWN_PCT = -10.0
+EVENT_MIN_AMPLITUDE_PCT = max(0.1, float(os.getenv("ZONE3_EVENT_MIN_AMPLITUDE_PCT", "7.0")))
+EVENT_MIN_VOLUME_BURST_MULTIPLE = max(1.0, float(os.getenv("ZONE3_EVENT_MIN_VOLUME_BURST_MULTIPLE", "3.0")))
 WINDOW_MINUTES = 30
 UPSERT_BATCH_SIZE = max(1, int(os.getenv("ZONE3_UPSERT_BATCH_SIZE", "100")))
 LOOKBACK_DAYS = max(30, int(os.getenv("ZONE3_LOOKBACK_DAYS", "365")))
@@ -752,20 +758,45 @@ def extract_daily_events(symbol: str, daily_df: pd.DataFrame) -> list[EventCandi
     if daily_df.empty or len(daily_df) < 2:
         return []
 
+    required = ["Date", "High", "Low", "Volume"]
+    if any(col not in daily_df.columns for col in required):
+        emit("log", f"[EVENT] {symbol} 일봉 컬럼 누락으로 이벤트 추출 불가", level="warn")
+        return []
+
     df = daily_df.copy()
-    df["prev_close"] = df["Close"].shift(1)
-    df = df.dropna(subset=["prev_close"])
-    df["high_pct_change"] = ((df["High"] - df["prev_close"]) / df["prev_close"]) * 100.0
-    df["low_pct_change"] = ((df["Low"] - df["prev_close"]) / df["prev_close"]) * 100.0
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df = df.dropna(subset=["Date"])
+    for col in ["High", "Low", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["High", "Low", "Volume"])
+    df = df.sort_values("Date")
+    df = df.drop_duplicates(subset=["Date"], keep="first")
+
+    # 요구사항: 장중 진폭(%) 컬럼 추가
+    df["amplitude"] = (((df["High"] - df["Low"]) / df["Low"]) * 100.0).where(df["Low"] > 0)
+    # 요구사항: 거래량 20일 이동평균(min_periods=1)과 직전일 기준값 계산
+    df["vol_ma20"] = df["Volume"].rolling(window=20, min_periods=1).mean()
+    df["vol_ma20_prev"] = df["vol_ma20"].shift(1)
+
+    filtered = df[
+        (df["amplitude"] >= EVENT_MIN_AMPLITUDE_PCT)
+        & (df["vol_ma20_prev"] > 0)
+        & (df["Volume"] >= (df["vol_ma20_prev"] * EVENT_MIN_VOLUME_BURST_MULTIPLE))
+    ]
+    if filtered.empty:
+        return []
 
     events: list[EventCandidate] = []
-    for row in df.itertuples(index=False):
-        high_pct = float(row.high_pct_change)
-        low_pct = float(row.low_pct_change)
-        if high_pct >= EVENT_UP_PCT:
-            events.append(EventCandidate(symbol=symbol, klass="CLASS_A", event_date=row.Date, pct_change=high_pct))
-        if low_pct <= EVENT_DOWN_PCT:
-            events.append(EventCandidate(symbol=symbol, klass="CLASS_C", event_date=row.Date, pct_change=low_pct))
+    for row in filtered.itertuples(index=False):
+        # 요구사항: 이벤트 클래스는 모두 CLASS_VOLATILE로 고정
+        events.append(
+            EventCandidate(
+                symbol=symbol,
+                klass="CLASS_VOLATILE",
+                event_date=row.Date,
+                pct_change=float(row.amplitude),
+            )
+        )
     return events
 
 
@@ -789,6 +820,8 @@ def cut_window_before_event(minute_df: pd.DataFrame, event_idx: int, window: int
 
 
 def minmax_scale(series: np.ndarray) -> np.ndarray:
+    if np is None:
+        raise RuntimeError("numpy 모듈이 없어 벡터화를 수행할 수 없습니다.")
     s_min = float(np.min(series))
     s_max = float(np.max(series))
     if math.isclose(s_min, s_max, rel_tol=1e-9, abs_tol=1e-9):
@@ -797,6 +830,8 @@ def minmax_scale(series: np.ndarray) -> np.ndarray:
 
 
 def vectorize_ohlvc(minute_window_df: pd.DataFrame, dim: int) -> list[float]:
+    if np is None:
+        raise RuntimeError("numpy 모듈이 없어 벡터화를 수행할 수 없습니다.")
     if minute_window_df.empty:
         return [0.0] * dim
 
@@ -834,6 +869,8 @@ def read_oracle_env() -> tuple[str, str, str]:
 
 
 def fetch_existing_symbols_from_db() -> set[str]:
+    if oracledb is None:
+        raise RuntimeError("oracledb 모듈이 없어 DB 조회를 사용할 수 없습니다.")
     user, password, connect_string = read_oracle_env()
     symbols: set[str] = set()
     with oracledb.connect(user=user, password=password, dsn=connect_string) as conn:
@@ -851,6 +888,8 @@ def fetch_existing_symbols_from_db() -> set[str]:
 def upsert_patterns(records: list[PatternRecord]) -> int:
     if not records:
         return 0
+    if oracledb is None:
+        raise RuntimeError("oracledb 모듈이 없어 DB 적재를 사용할 수 없습니다.")
 
     user, password, connect_string = read_oracle_env()
     merged = 0
@@ -934,14 +973,10 @@ def load_or_fetch_minute(symbol: str, event_date: dt.date, kis: KisClient) -> pd
     if not cached.empty:
         return cached
 
-    # KIS 분봉 API(FHKST03010200)는 실질적으로 당일 분봉 위주로 반환된다.
-    # 캐시가 없는 과거 날짜는 호출해도 빈 결과일 가능성이 높아 API 호출을 생략한다.
-    if event_date != dt.date.today():
-        return pd.DataFrame()
-
     if not kis.enabled:
         return pd.DataFrame()
 
+    # 요구사항: 이벤트 발생일(event_date) 기준으로만 분봉 API를 호출한다.
     df = kis.fetch_event_day_minutes(symbol, event_date)
     if df.empty:
         return pd.DataFrame()
@@ -960,7 +995,6 @@ def sync_raw_data(
     symbol_limit: int,
     max_events_per_symbol: int,
 ) -> None:
-    today = dt.date.today()
     for idx, total, symbol, name in iter_symbols(listing, symbol_limit):
         emit("log", f"[SYNC {idx}/{total}] {symbol} {name} raw 수집", level="info")
 
@@ -969,31 +1003,25 @@ def sync_raw_data(
             emit("log", f"[SYNC] {symbol} 일봉 수집 실패/없음", level="warn")
             continue
 
+        # 요구사항: 일봉은 가져온 결과를 매번 CSV로 정규화 저장한다.
+        save_daily_raw(symbol, daily_df)
         events = extract_daily_events(symbol, daily_df)
         if not events:
             continue
 
-        events = sorted(events, key=lambda e: abs(e.pct_change), reverse=True)[: max(1, max_events_per_symbol)]
+        events = sorted(events, key=lambda e: abs(e.pct_change), reverse=True)
+        # 요구사항: max-events-per-symbol <= 0 이면 이벤트 개수 제한을 적용하지 않는다.
+        if max_events_per_symbol > 0:
+            events = events[:max_events_per_symbol]
         if not kis.enabled:
             emit("log", f"[SYNC] {symbol} KIS 비활성화로 분봉 raw 수집 생략", level="warn")
             continue
 
         minute_saved = 0
-        skipped_historical_minute = 0
         for event in events:
             minute_df = load_or_fetch_minute(symbol, event.event_date, kis)
             if not minute_df.empty:
                 minute_saved += 1
-                continue
-            if event.event_date != today and not minute_raw_path(symbol, event.event_date).exists():
-                skipped_historical_minute += 1
-
-        if skipped_historical_minute > 0:
-            emit(
-                "log",
-                f"[SYNC] {symbol} 과거 이벤트 {skipped_historical_minute}건은 KIS 분봉 제한(당일 위주)으로 raw 미수집",
-                level="warn",
-            )
         emit(
             "log",
             f"[SYNC] {symbol} 분봉 raw 저장 {minute_saved}/{len(events)}",
@@ -1042,7 +1070,9 @@ def transform_and_upsert(
         if not events:
             continue
 
-        events = sorted(events, key=lambda e: abs(e.pct_change), reverse=True)[: max(1, max_events_per_symbol)]
+        events = sorted(events, key=lambda e: abs(e.pct_change), reverse=True)
+        if max_events_per_symbol > 0:
+            events = events[:max_events_per_symbol]
 
         for event in events:
             minute_df = load_minute_raw(symbol, event.event_date)
@@ -1101,9 +1131,13 @@ def transform_and_upsert(
 
 def run() -> None:
     parser = argparse.ArgumentParser(description="Zone3 data-lake miner")
-    parser.add_argument("--vector-dim", type=int, default=ZONE3_VECTOR_DIM)
     parser.add_argument("--symbol-limit", type=int, default=int(os.getenv("ZONE3_MINE_SYMBOL_LIMIT", "2000")))
-    parser.add_argument("--max-events-per-symbol", type=int, default=int(os.getenv("ZONE3_MINE_MAX_EVENTS_PER_SYMBOL", "6")))
+    parser.add_argument(
+        "--max-events-per-symbol",
+        type=int,
+        default=int(os.getenv("ZONE3_MINE_MAX_EVENTS_PER_SYMBOL", "0")),
+        help="종목당 이벤트 상한(0 또는 음수면 제한 없음)",
+    )
     parser.add_argument("--exclude-keywords", default="ETF,ETN,스팩,SPAC,우선주,우B,우C,리츠")
     args = parser.parse_args()
 
@@ -1117,41 +1151,22 @@ def run() -> None:
     listing = get_market_symbols(exclude_keywords=exclude_keywords)
     if listing.empty:
         raise RuntimeError("종목 마스터 리스트 수집 실패(FDR/PYKRX/KIND)")
-    try:
-        existing_symbols = fetch_existing_symbols_from_db()
-    except Exception as exc:
-        emit("log", f"[DB] 기존 적재 종목 조회 실패, 전체 스캔으로 진행: {exc}", level="warn")
-        existing_symbols = set()
-
-    if existing_symbols:
-        listing = listing[~listing["Symbol"].isin(existing_symbols)].reset_index(drop=True)
-
-    if listing.empty:
-        emit(
-            "completed",
-            "이미 모든 종목이 적재되어 있어 작업할 대상이 없습니다.",
-            running=False,
-            progress=100,
-            inserted=0,
-        )
-        return
 
     http = HttpClient()
     kis = KisClient(http=http)
 
     emit(
         "status",
-        "Zone3 마이닝 시작",
+        "Zone3 raw 수집 시작",
         running=True,
         progress=0,
         start_date=str(start_date),
         end_date=str(end_date),
         symbols_total=min(args.symbol_limit, len(listing)),
-        resume_skip_symbols=len(existing_symbols),
         raw_base_dir=str(RAW_BASE_DIR.resolve()),
         lookback_days=LOOKBACK_DAYS,
-        upsert_batch_size=UPSERT_BATCH_SIZE,
         kis_enabled=kis.enabled,
+        mode="raw_only",
     )
 
     sync_raw_data(
@@ -1163,26 +1178,15 @@ def run() -> None:
         max_events_per_symbol=args.max_events_per_symbol,
     )
 
-    generated, merged, class_a, class_c = transform_and_upsert(
-        listing=listing,
-        symbol_limit=args.symbol_limit,
-        max_events_per_symbol=args.max_events_per_symbol,
-        vector_dim=args.vector_dim,
-    )
-
-    if generated <= 0:
-        emit("completed", "생성된 패턴이 없어 DB 적재를 건너뜀", running=False, progress=100, inserted=0)
-        return
-
+    # 요구사항: 현재 단계는 Raw CSV 수집기 역할만 수행하고 종료한다.
     emit(
         "completed",
-        f"Zone3 마이닝 완료 records={generated} merged={merged}",
+        "Zone3 raw 수집 완료",
         running=False,
         progress=100,
-        processed=generated,
-        inserted=merged,
-        class_a=class_a,
-        class_c=class_c,
+        processed_symbols=min(args.symbol_limit, len(listing)),
+        inserted=0,
+        mode="raw_only",
     )
 
 
