@@ -6,6 +6,7 @@ import { useMemo, useState } from "react";
 import { formatKrw, formatPct, formatTs } from "@/lib/format";
 import { decisionActionKo, narrativeKo, orderSideKo, orderSourceKo, orderStatusKo } from "@/lib/korean";
 import type { OrchestratorHealth } from "@/lib/orchestrator-health";
+import { formatSymbolLabel } from "@/lib/symbol-label";
 
 import { Panel } from "./panel";
 
@@ -14,9 +15,10 @@ interface RightPanelProps {
   health: OrchestratorHealth | null;
   busy: boolean;
   onManualOrder: (side: OrderSide, qty: number) => Promise<void>;
+  symbolNames: Record<string, string>;
 }
 
-export function RightPanel({ snapshot, health, busy, onManualOrder }: RightPanelProps) {
+export function RightPanel({ snapshot, health, busy, onManualOrder, symbolNames }: RightPanelProps) {
   const [qty, setQty] = useState<number>(1);
 
   const active = useMemo(
@@ -38,7 +40,7 @@ export function RightPanel({ snapshot, health, busy, onManualOrder }: RightPanel
     <Panel
       title="체결 실행 및 호가창"
       subtitle="실행 로그 / 보유종목 / 수동 오버라이드"
-      className="h-full"
+      className="h-full min-w-0"
       rightSlot={
         <span className="rounded-full border border-slate-700/80 bg-slate-900/80 px-2 py-0.5 text-[11px] text-slate-300">
           존6 기록 {health?.zone6.recordCount ?? "-"}
@@ -48,11 +50,11 @@ export function RightPanel({ snapshot, health, busy, onManualOrder }: RightPanel
       <div className="grid h-full grid-rows-[auto_auto_1fr_auto] gap-3">
         <div className="rounded-xl border border-slate-700/60 bg-slate-900/65 p-3">
           <p className="text-xs uppercase tracking-[0.2em] text-slate-400">존 5 최종 판단</p>
-          <div className="mt-1 flex items-center justify-between">
-            <p className="text-sm font-semibold text-slate-100">
+          <div className="mt-1 flex min-w-0 items-center justify-between gap-2">
+            <p className="min-w-0 truncate text-sm font-semibold text-slate-100">
               {decisionActionKo(snapshot.decision.action)} ({(snapshot.decision.confidenceScore * 100).toFixed(1)}%)
             </p>
-            <span className="rounded-md border border-slate-700/70 bg-slate-950/70 px-2 py-0.5 text-[11px] text-slate-300">
+            <span className="shrink-0 rounded-md border border-slate-700/70 bg-slate-950/70 px-2 py-0.5 text-[11px] text-slate-300">
               비중 {snapshot.decision.suggestedWeightPct.toFixed(0)}%
             </span>
           </div>
@@ -70,9 +72,9 @@ export function RightPanel({ snapshot, health, busy, onManualOrder }: RightPanel
               <div className="bg-rose-400" style={{ width: `${askPct.toFixed(1)}%` }} />
             </div>
           </div>
-          <div className="mt-1 flex items-center justify-between text-[11px] text-slate-300">
-            <span>매수 잔량 {formatKrw(bidDepth)}</span>
-            <span>매도 잔량 {formatKrw(askDepth)}</span>
+          <div className="mt-1 grid grid-cols-2 gap-2 text-[11px] text-slate-300">
+            <span className="truncate">매수 잔량 {formatKrw(bidDepth)}</span>
+            <span className="truncate text-right">매도 잔량 {formatKrw(askDepth)}</span>
           </div>
         </div>
 
@@ -87,7 +89,7 @@ export function RightPanel({ snapshot, health, busy, onManualOrder }: RightPanel
                   <div key={position.symbol} className="rounded-md border border-slate-700/70 bg-slate-950/60 p-2">
                     <div className="flex items-center justify-between">
                       <p className="font-semibold text-slate-100">
-                        {position.symbol} / {position.qty}주
+                        {formatSymbolLabel(position.symbol, symbolNames, position.name)} / {position.qty}주
                       </p>
                       <span className={position.pnlPct >= 0 ? "text-rose-300" : "text-blue-300"}>{formatPct(position.pnlPct)}</span>
                     </div>
@@ -108,7 +110,7 @@ export function RightPanel({ snapshot, health, busy, onManualOrder }: RightPanel
               ) : (
                 snapshot.orderLog.slice(0, 30).map((log) => (
                   <p key={log.id} className="truncate text-slate-200">
-                    [{formatTs(log.timestamp)}] {orderSourceKo(log.source)} {orderSideKo(log.side)} {log.symbol} {log.qty}주 /{" "}
+                    [{formatTs(log.timestamp)}] {orderSourceKo(log.source)} {orderSideKo(log.side)} {formatSymbolLabel(log.symbol, symbolNames)} {log.qty}주 /{" "}
                     {formatKrw(log.price)}원{" "}
                     <span className={log.status === "FILLED" ? "text-emerald-300" : "text-amber-300"}>
                       {orderStatusKo(log.status)}
@@ -130,7 +132,7 @@ export function RightPanel({ snapshot, health, busy, onManualOrder }: RightPanel
               onChange={(e) => setQty(Math.max(1, Number(e.target.value || 1)))}
               className="w-24 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-100"
             />
-            <span className="text-xs text-slate-400">수량 ({snapshot.targetSymbol})</span>
+            <span className="text-xs text-slate-400">수량 ({formatSymbolLabel(snapshot.targetSymbol, symbolNames)})</span>
           </div>
 
           <div className="mt-2 flex flex-wrap gap-1.5">

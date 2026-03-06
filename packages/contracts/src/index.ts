@@ -128,11 +128,22 @@ export interface Zone5Decision {
   generatedAt: string;
 }
 
+export interface WatchPoolItem {
+  symbol: string;
+  spikeRatio: number;
+  volumePower: number;
+  maDivergence: number;
+  lastPrice: number;
+  updatedAt: string;
+}
+
 export interface DashboardSnapshot {
   network: NetworkServiceStatus[];
   account: AccountSnapshot;
   killSwitchOn: boolean;
   targetSymbol: string;
+  targetReason: string;
+  watchPool: WatchPoolItem[];
   globalContext: GlobalMacroContext;
   tick: Zone0Tick;
   technical: Zone1Technical;
@@ -190,6 +201,8 @@ export function createEmptyDashboardSnapshot(): DashboardSnapshot {
     },
     killSwitchOn: false,
     targetSymbol: "UNKNOWN",
+    targetReason: "초기 상태: 타겟 탐색 대기",
+    watchPool: [],
     globalContext: {
       usdKrw: 0,
       us10yYield: 0,

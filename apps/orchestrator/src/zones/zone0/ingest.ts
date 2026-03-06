@@ -12,16 +12,56 @@ import { MacroContextClient } from "./macro-context-client.js";
 import { MarketFlowClient } from "./market-flow-client.js";
 import { NaverNewsClient } from "./naver-news-client.js";
 
-const DEFAULT_SYMBOL = (process.env.ZONE0_TARGET_SYMBOL ?? "005930").trim();
+const DEFAULT_SYMBOL = sanitizeSymbol(process.env.ZONE0_TARGET_SYMBOL ?? "005930");
 const MAX_BUFFER_SIZE = Math.max(100, Number(process.env.ZONE0_BUFFER_SIZE ?? 600));
 const MAX_FRAME_QUEUE_SIZE = Math.max(10, Number(process.env.ZONE0_FRAME_QUEUE_SIZE ?? 3_000));
 const EXTERNAL_POLL_MS = clamp(Number(process.env.ZONE0_EXTERNAL_POLL_MS ?? 60_000), 60_000, 300_000);
 const BOARD_POLL_MS = clamp(Number(process.env.ZONE0_BOARD_POLL_MS ?? 20_000), 10_000, 60_000);
 const MARKET_FLOW_POLL_MS = clamp(Number(process.env.ZONE0_MARKET_FLOW_POLL_MS ?? 60_000), 30_000, 300_000);
 const MACRO_POLL_MS = clamp(Number(process.env.ZONE0_MACRO_POLL_MS ?? 1_800_000), 300_000, 3_600_000);
+const SYMBOL_POOL_REFRESH_MS = clamp(Number(process.env.ZONE0_SYMBOL_POOL_REFRESH_MS ?? 60_000), 30_000, 300_000);
+const SYMBOL_POOL_SIZE = clamp(Number(process.env.ZONE0_SYMBOL_POOL_SIZE ?? 12), 5, 20);
 const SEEN_KEY_LIMIT = Math.max(1_000, Number(process.env.ZONE0_SEEN_KEY_LIMIT ?? 20_000));
 const NAVER_REQUEST_TIMEOUT_MS = Math.max(2_000, Number(process.env.ZONE0_NAVER_TIMEOUT_MS ?? 8_000));
+const KIS_HOTLIST_TIMEOUT_MS = Math.max(2_000, Number(process.env.ZONE0_KIS_HOTLIST_TIMEOUT_MS ?? 10_000));
 const NEWS_KEYWORDS = parseCsv(process.env.ZONE0_NEWS_KEYWORDS ?? "");
+const SYMBOL_DISCOVERY_ENABLED = parseBool(process.env.ZONE0_SYMBOL_DISCOVERY_ENABLED, true);
+const KIS_REST_URL = String(process.env.KIS_REST_URL ?? "").trim();
+const KIS_APP_KEY = String(process.env.KIS_APP_KEY ?? "").trim();
+const KIS_APP_SECRET = String(process.env.KIS_APP_SECRET ?? "").trim();
+const KIS_TOKEN_PATH = "/oauth2/tokenP";
+const KIS_HOTLIST_PATH = String(process.env.ZONE0_KIS_HOTLIST_PATH ?? "/uapi/domestic-stock/v1/quotations/volume-rank").trim();
+const KIS_HOTLIST_TR_ID = String(process.env.ZONE0_KIS_HOTLIST_TR_ID ?? "FHPST01710000").trim();
+const KIS_HOTLIST_MARKET_DIV = String(process.env.ZONE0_KIS_HOTLIST_MARKET_DIV ?? "J").trim();
+const KIS_HOTLIST_SCREEN_DIV = String(process.env.ZONE0_KIS_HOTLIST_SCREEN_DIV ?? "20171").trim();
+const KIS_HOTLIST_INPUT_ISCD = String(process.env.ZONE0_KIS_HOTLIST_INPUT_ISCD ?? "0000").trim();
+const KIS_HOTLIST_DIV_CLS_CODE = String(process.env.ZONE0_KIS_HOTLIST_DIV_CLS_CODE ?? "0").trim();
+const KIS_HOTLIST_BLNG_CLS_CODE = String(process.env.ZONE0_KIS_HOTLIST_BLNG_CLS_CODE ?? "0").trim();
+const KIS_HOTLIST_TRGT_CLS_CODE = String(process.env.ZONE0_KIS_HOTLIST_TRGT_CLS_CODE ?? "111111111").trim();
+const KIS_HOTLIST_TRGT_EXLS_CLS_CODE = String(process.env.ZONE0_KIS_HOTLIST_TRGT_EXLS_CLS_CODE ?? "0000000000").trim();
+const KIS_HOTLIST_INPUT_PRICE_1 = String(process.env.ZONE0_KIS_HOTLIST_INPUT_PRICE_1 ?? "").trim();
+const KIS_HOTLIST_INPUT_PRICE_2 = String(process.env.ZONE0_KIS_HOTLIST_INPUT_PRICE_2 ?? "").trim();
+const KIS_HOTLIST_VOL_CNT = String(process.env.ZONE0_KIS_HOTLIST_VOL_CNT ?? "").trim();
+const KIS_HOTLIST_INPUT_DATE_1 = String(process.env.ZONE0_KIS_HOTLIST_INPUT_DATE_1 ?? "").trim();
+const KIS_TOKEN_SKEW_MS = 60_000;
+
+const HOT_SYMBOL_FIELD_KEYS = [
+  "mksc_shrn_iscd",
+  "stck_shrn_iscd",
+  "isu_cd",
+  "ISU_CD",
+  "pdno",
+  "item_code",
+  "symbol",
+  "code",
+  "stck_cd",
+  "종목코드"
+];
+
+interface KisAccessTokenResponse {
+  access_token?: string;
+  expires_in?: number | string;
+}
 
 const NAVER_HEADERS = {
   "User-Agent":
@@ -152,6 +192,12 @@ export interface Zone0BufferSnapshot {
   lastFrameAt: string | null;
 }
 
+export interface Zone0RealtimeStatus {
+  kisConnected: boolean;
+  primarySymbol: string;
+  watchSymbols: string[];
+}
+
 export interface Zone0Gateway {
   emitter: EventEmitter;
   start: (params?: { targetSymbol?: string }) => Promise<void>;
@@ -161,6 +207,7 @@ export interface Zone0Gateway {
   hasPendingFrame: () => boolean;
   ingestTelegramWebhook: (payload: Zone0TelegramWebhookPayload) => Zone0TelegramMessage | null;
   getBufferSnapshot: () => Zone0BufferSnapshot;
+  getRealtimeStatus: () => Zone0RealtimeStatus;
 }
 
 interface PendingBucket {
@@ -191,23 +238,34 @@ export function createZone0Gateway(): Zone0Gateway {
   const boardSeen = new Set<string>();
   const boardSeenQueue: string[] = [];
 
-  let currentSymbol = sanitizeSymbol(DEFAULT_SYMBOL);
+  let manualTargetSymbol = sanitizeSymbol(DEFAULT_SYMBOL);
+  let manualPinEnabled = false;
+  let currentSymbol = manualTargetSymbol;
+  let watchSymbols: string[] = [manualTargetSymbol];
+  let discoveredSymbols: string[] = [];
+  let roundRobinCursor = 0;
   let started = false;
   let lastFrameAt: string | null = null;
   let wsClient: KisWebSocketClient | null = null;
+  let symbolPoolTimer: NodeJS.Timeout | null = null;
   let externalTimer: NodeJS.Timeout | null = null;
   let boardTimer: NodeJS.Timeout | null = null;
   let marketFlowTimer: NodeJS.Timeout | null = null;
   let macroTimer: NodeJS.Timeout | null = null;
+  let pollingSymbolPool = false;
   let pollingNews = false;
   let pollingDart = false;
   let pollingBoard = false;
   let pollingMarketFlow = false;
   let pollingMacro = false;
+  let warnedSymbolPoolDisabled = false;
   let warnedNaverDisabled = false;
   let warnedDartDisabled = false;
   let warnedMarketFlowDisabled = false;
   let warnedMacroDisabled = false;
+  let kisRealtimeConnected = false;
+  let kisAccessToken: string | null = null;
+  let kisAccessTokenExpireAt = 0;
   const naverNewsClient = new NaverNewsClient({
     timeoutMs: NAVER_REQUEST_TIMEOUT_MS
   });
@@ -238,6 +296,214 @@ export function createZone0Gateway(): Zone0Gateway {
     };
     pendingBySymbol.set(key, created);
     return created;
+  }
+
+  function getWatchSymbolsSnapshot(): string[] {
+    if (watchSymbols.length > 0) {
+      return [...watchSymbols];
+    }
+    return [manualTargetSymbol];
+  }
+
+  function pickRoundRobinSymbol(): string {
+    const pool = getWatchSymbolsSnapshot();
+    if (pool.length === 0) {
+      return manualTargetSymbol;
+    }
+
+    const index = roundRobinCursor % pool.length;
+    roundRobinCursor = (roundRobinCursor + 1) % Math.max(1, pool.length);
+    return pool[index] ?? manualTargetSymbol;
+  }
+
+  function buildMergedWatchSymbols(nextDiscovered: string[]): string[] {
+    const merged: string[] = [];
+    const seen = new Set<string>();
+    const candidates = manualPinEnabled ? [manualTargetSymbol, ...nextDiscovered] : nextDiscovered;
+
+    for (const candidate of candidates) {
+      const symbol = sanitizeSymbol(candidate);
+      if (!symbol || seen.has(symbol)) {
+        continue;
+      }
+
+      seen.add(symbol);
+      merged.push(symbol);
+      if (merged.length >= SYMBOL_POOL_SIZE) {
+        break;
+      }
+    }
+
+    if (merged.length === 0) {
+      merged.push(DEFAULT_SYMBOL);
+    }
+
+    return merged;
+  }
+
+  async function applyWatchSymbols(nextSymbols: string[], reason: string): Promise<void> {
+    const normalized = normalizeSymbolList(nextSymbols);
+    const previous = watchSymbols;
+    if (sameStringArray(previous, normalized)) {
+      return;
+    }
+
+    const removed = previous.filter((symbol) => !normalized.includes(symbol));
+    watchSymbols = normalized;
+    currentSymbol = watchSymbols[0] ?? manualTargetSymbol;
+    roundRobinCursor = 0;
+
+    for (const symbol of removed) {
+      pendingBySymbol.delete(symbol);
+      latestTickBySymbol.delete(symbol);
+      latestOrderBookBySymbol.delete(symbol);
+    }
+
+    if (wsClient) {
+      await wsClient.updateSymbols(watchSymbols);
+    }
+
+    console.info(
+      `[zone0][symbol-pool] updated (${reason}) size=${watchSymbols.length} symbols=${watchSymbols.join(",")}`
+    );
+  }
+
+  function isSymbolDiscoveryReady(): boolean {
+    return Boolean(
+      SYMBOL_DISCOVERY_ENABLED &&
+        KIS_REST_URL &&
+        KIS_APP_KEY &&
+        KIS_APP_SECRET &&
+        KIS_HOTLIST_PATH &&
+        KIS_HOTLIST_TR_ID
+    );
+  }
+
+  async function fetchKisAccessToken(): Promise<string> {
+    const now = Date.now();
+    if (kisAccessToken && now + KIS_TOKEN_SKEW_MS < kisAccessTokenExpireAt) {
+      return kisAccessToken;
+    }
+
+    const tokenUrl = buildHttpUrl(KIS_REST_URL, KIS_TOKEN_PATH);
+    const response = await runWithRetry(
+      () =>
+        axios.post<KisAccessTokenResponse>(
+          tokenUrl,
+          {
+            grant_type: "client_credentials",
+            appkey: KIS_APP_KEY,
+            appsecret: KIS_APP_SECRET
+          },
+          {
+            headers: {
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            timeout: KIS_HOTLIST_TIMEOUT_MS
+          }
+        ),
+      {
+        context: "zone0:kis-token"
+      }
+    );
+
+    const token = String(response.data.access_token ?? "").trim();
+    if (!token) {
+      throw new Error("KIS access_token 발급 실패");
+    }
+
+    const expiresInSec = Number(response.data.expires_in ?? 0);
+    const ttlMs = Number.isFinite(expiresInSec) && expiresInSec > 0 ? expiresInSec * 1_000 : 3_600_000;
+    kisAccessToken = token;
+    kisAccessTokenExpireAt = now + ttlMs;
+    return token;
+  }
+
+  async function fetchHotSymbolsFromKis(): Promise<string[]> {
+    const token = await fetchKisAccessToken();
+    const url = buildHttpUrl(KIS_REST_URL, KIS_HOTLIST_PATH);
+    const payload = await runWithRetry(
+      async () => {
+        const response = await axios.get<unknown>(url, {
+          timeout: KIS_HOTLIST_TIMEOUT_MS,
+          headers: {
+            authorization: `Bearer ${token}`,
+            appkey: KIS_APP_KEY,
+            appsecret: KIS_APP_SECRET,
+            tr_id: KIS_HOTLIST_TR_ID,
+            custtype: "P"
+          },
+          params: {
+            FID_COND_MRKT_DIV_CODE: KIS_HOTLIST_MARKET_DIV,
+            FID_COND_SCR_DIV_CODE: KIS_HOTLIST_SCREEN_DIV,
+            FID_INPUT_ISCD: KIS_HOTLIST_INPUT_ISCD,
+            FID_DIV_CLS_CODE: KIS_HOTLIST_DIV_CLS_CODE,
+            FID_BLNG_CLS_CODE: KIS_HOTLIST_BLNG_CLS_CODE,
+            FID_TRGT_CLS_CODE: KIS_HOTLIST_TRGT_CLS_CODE,
+            FID_TRGT_EXLS_CLS_CODE: KIS_HOTLIST_TRGT_EXLS_CLS_CODE,
+            FID_INPUT_PRICE_1: KIS_HOTLIST_INPUT_PRICE_1,
+            FID_INPUT_PRICE_2: KIS_HOTLIST_INPUT_PRICE_2,
+            FID_VOL_CNT: KIS_HOTLIST_VOL_CNT,
+            FID_INPUT_DATE_1: KIS_HOTLIST_INPUT_DATE_1
+          }
+        });
+
+        // 토큰 만료/인증오류가 의심되면 다음 호출에서 토큰 재발급하도록 캐시를 폐기한다.
+        if (response.data && typeof response.data === "object") {
+          const body = response.data as Record<string, unknown>;
+          const rtCd = String(body.rt_cd ?? "").trim();
+          if (rtCd && rtCd !== "0") {
+            const msgCd = String(body.msg_cd ?? "").trim();
+            const message = String(body.msg1 ?? body.msg ?? "KIS hotlist failed").trim();
+            if (msgCd === "EGW00123" || msgCd === "EGW00121" || message.includes("token")) {
+              kisAccessToken = null;
+              kisAccessTokenExpireAt = 0;
+            }
+          }
+        }
+
+        return response.data;
+      },
+      {
+        context: "zone0:kis-hot-symbols"
+      }
+    );
+
+    return extractSymbolsFromHotListPayload(payload, SYMBOL_POOL_SIZE);
+  }
+
+  async function refreshSymbolPool(reason: string): Promise<void> {
+    if (pollingSymbolPool) {
+      return;
+    }
+
+    if (!isSymbolDiscoveryReady()) {
+      if (!warnedSymbolPoolDisabled) {
+        warnedSymbolPoolDisabled = true;
+        console.warn(
+          "[zone0][symbol-pool] KIS 심볼 탐색 비활성화 (ZONE0_SYMBOL_DISCOVERY_ENABLED/KIS_REST_URL/KIS_APP_KEY/KIS_APP_SECRET 확인)"
+        );
+      }
+      await applyWatchSymbols([manualTargetSymbol], "fallback");
+      return;
+    }
+
+    pollingSymbolPool = true;
+    try {
+      const symbols = await fetchHotSymbolsFromKis();
+      if (symbols.length === 0) {
+        return;
+      }
+
+      discoveredSymbols = symbols;
+      const merged = buildMergedWatchSymbols(discoveredSymbols);
+      await applyWatchSymbols(merged, reason);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[zone0][symbol-pool] refresh failed: ${message}`);
+    } finally {
+      pollingSymbolPool = false;
+    }
   }
 
   function buildZone0OrderBook(raw: KisOrderBook): Zone0OrderBook {
@@ -606,12 +872,16 @@ export function createZone0Gateway(): Zone0Gateway {
   }
 
   async function start(params?: { targetSymbol?: string }): Promise<void> {
-    if (params?.targetSymbol) {
-      currentSymbol = sanitizeSymbol(params.targetSymbol);
+    const explicitTarget = toExplicitSymbol(params?.targetSymbol);
+    if (explicitTarget) {
+      manualTargetSymbol = explicitTarget;
+      manualPinEnabled = true;
+      currentSymbol = manualTargetSymbol;
+      watchSymbols = normalizeSymbolList([manualTargetSymbol]);
     }
 
     if (started) {
-      await setTargetSymbol(currentSymbol);
+      await setTargetSymbol(manualTargetSymbol);
       return;
     }
 
@@ -633,42 +903,61 @@ export function createZone0Gateway(): Zone0Gateway {
       warnedMacroDisabled = true;
       console.warn("[zone0][macro] 거시지표 endpoint 미설정으로 Global Context 수집이 비활성화됩니다.");
     }
+    if (!isSymbolDiscoveryReady() && !warnedSymbolPoolDisabled) {
+      warnedSymbolPoolDisabled = true;
+      console.warn(
+        "[zone0][symbol-pool] KIS 심볼 탐색 비활성화 (ZONE0_SYMBOL_DISCOVERY_ENABLED/KIS_REST_URL/KIS_APP_KEY/KIS_APP_SECRET 확인)"
+      );
+    }
+
+    symbolPoolTimer = setInterval(() => {
+      void refreshSymbolPool("interval");
+    }, SYMBOL_POOL_REFRESH_MS);
 
     externalTimer = setInterval(() => {
-      void pollExternalFeeds(currentSymbol);
+      void pollExternalFeeds(pickRoundRobinSymbol());
     }, EXTERNAL_POLL_MS);
     boardTimer = setInterval(() => {
-      void pollNaverBoard(currentSymbol);
+      void pollNaverBoard(pickRoundRobinSymbol());
     }, BOARD_POLL_MS);
     marketFlowTimer = setInterval(() => {
-      void pollMarketFlow(currentSymbol);
+      void pollMarketFlow(pickRoundRobinSymbol());
     }, MARKET_FLOW_POLL_MS);
     macroTimer = setInterval(() => {
       void pollMacroContext(currentSymbol);
     }, MACRO_POLL_MS);
 
-    void pollExternalFeeds(currentSymbol);
-    void pollNaverBoard(currentSymbol);
-    void pollMarketFlow(currentSymbol);
-    void pollMacroContext(currentSymbol);
-
     try {
       wsClient = new KisWebSocketClient({
-        targetSymbol: currentSymbol,
+        targetSymbols: getWatchSymbolsSnapshot(),
+        onConnectionStateChange: (connected) => {
+          kisRealtimeConnected = connected;
+        },
         onTick: (tick) => onKisTick(tick),
         onOrderBook: (orderBook) => onKisOrderBook(orderBook)
       });
-      await wsClient.start(currentSymbol);
-      console.info(`[zone0] KIS websocket started for ${currentSymbol}`);
+      await wsClient.start(getWatchSymbolsSnapshot());
+      console.info(`[zone0] KIS websocket started for ${getWatchSymbolsSnapshot().join(",")}`);
     } catch (error) {
       wsClient = null;
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[zone0] KIS websocket init failed: ${message}`);
     }
+
+    void refreshSymbolPool("startup");
+    void pollExternalFeeds(currentSymbol);
+    void pollNaverBoard(currentSymbol);
+    void pollMarketFlow(currentSymbol);
+    void pollMacroContext(currentSymbol);
   }
 
   async function stop(): Promise<void> {
     started = false;
+
+    if (symbolPoolTimer) {
+      clearInterval(symbolPoolTimer);
+      symbolPoolTimer = null;
+    }
 
     if (externalTimer) {
       clearInterval(externalTimer);
@@ -692,15 +981,17 @@ export function createZone0Gateway(): Zone0Gateway {
       await wsClient.stop();
       wsClient = null;
     }
+    kisRealtimeConnected = false;
   }
 
   async function setTargetSymbol(symbol: string): Promise<void> {
     const next = sanitizeSymbol(symbol);
+    manualTargetSymbol = next;
+    manualPinEnabled = true;
     currentSymbol = next;
 
-    if (wsClient) {
-      await wsClient.changeSymbol(next);
-    }
+    const nextWatch = buildMergedWatchSymbols(discoveredSymbols);
+    await applyWatchSymbols(nextWatch, "manual-target");
 
     void pollExternalFeeds(next);
     void pollNaverBoard(next);
@@ -740,6 +1031,11 @@ export function createZone0Gateway(): Zone0Gateway {
     consumeFrame: () => frameQueue.shift() ?? null,
     hasPendingFrame: () => frameQueue.length > 0,
     ingestTelegramWebhook,
+    getRealtimeStatus: () => ({
+      kisConnected: kisRealtimeConnected,
+      primarySymbol: currentSymbol,
+      watchSymbols: [...watchSymbols]
+    }),
     getBufferSnapshot: () => ({
       ticks: [...ticks],
       orderBooks: [...orderBooks],
@@ -801,9 +1097,143 @@ function seenBefore(store: Set<string>, queue: string[], key: string, limit: num
   return false;
 }
 
+function buildHttpUrl(baseUrl: string, path: string): string {
+  const normalizedBase = String(baseUrl).trim().replace(/\/+$/, "");
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${normalizedBase}${normalizedPath}`;
+}
+
+function normalizeSymbolList(symbols: string[]): string[] {
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of symbols) {
+    const symbol = sanitizeSymbol(raw);
+    if (!symbol || seen.has(symbol)) {
+      continue;
+    }
+    seen.add(symbol);
+    deduped.push(symbol);
+  }
+
+  return deduped.length > 0 ? deduped : [DEFAULT_SYMBOL];
+}
+
+function sameStringArray(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function extractSymbolsFromHotListPayload(payload: unknown, limit: number): string[] {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  const root = payload as Record<string, unknown>;
+  const statusCode = String(root.rt_cd ?? "").trim();
+  if (statusCode && statusCode !== "0") {
+    return [];
+  }
+
+  const sources = [root.output, root.output1, root.output2, root.data, root.result, root.list, root.items];
+  const symbols: string[] = [];
+  const seen = new Set<string>();
+
+  for (const source of sources) {
+    if (!Array.isArray(source)) {
+      continue;
+    }
+
+    for (const entry of source) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+
+      const record = entry as Record<string, unknown>;
+      const symbol = extractSymbolFromRecord(record);
+      if (!symbol || seen.has(symbol)) {
+        continue;
+      }
+
+      seen.add(symbol);
+      symbols.push(symbol);
+      if (symbols.length >= limit) {
+        return symbols;
+      }
+    }
+  }
+
+  return symbols;
+}
+
+function extractSymbolFromRecord(record: Record<string, unknown>): string | null {
+  for (const key of HOT_SYMBOL_FIELD_KEYS) {
+    if (!(key in record)) {
+      continue;
+    }
+
+    const candidate = String(record[key] ?? "").trim();
+    if (!candidate) {
+      continue;
+    }
+
+    const symbol = matchSixDigitSymbol(candidate);
+    if (symbol) {
+      return symbol;
+    }
+  }
+
+  return null;
+}
+
+function matchSixDigitSymbol(value: string): string | null {
+  const digits = value.replace(/[^\d]/g, "");
+  if (digits.length < 6) {
+    return null;
+  }
+  return digits.slice(0, 6);
+}
+
+function toExplicitSymbol(value: string | undefined): string | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return null;
+  }
+
+  const digits = raw.replace(/[^\d]/g, "");
+  if (digits.length >= 6) {
+    return digits.slice(0, 6);
+  }
+  if (digits.length > 0) {
+    return digits.padStart(6, "0");
+  }
+  return null;
+}
+
 function sanitizeSymbol(symbol: string): string {
-  const sanitized = String(symbol).trim();
-  return sanitized.length > 0 ? sanitized : "005930";
+  const raw = String(symbol ?? "").trim();
+  if (!raw) {
+    return "005930";
+  }
+
+  const digits = raw.replace(/[^\d]/g, "");
+  if (digits.length >= 6) {
+    return digits.slice(0, 6);
+  }
+  if (digits.length > 0) {
+    return digits.padStart(6, "0");
+  }
+
+  return "005930";
 }
 
 function normalizePriority(raw?: string): Zone0TelegramPriority {
@@ -872,4 +1302,23 @@ function parseCsv(value: string): string[] {
     .split(",")
     .map((token) => token.trim())
     .filter(Boolean);
+}
+
+function parseBool(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined) {
+    return fallback;
+  }
+
+  const normalized = String(raw).trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "n", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
 }

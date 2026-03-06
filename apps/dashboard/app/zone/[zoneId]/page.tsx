@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 
-import { ZoneDetailClientPage, ZONE_IDS, isZoneId } from "@/components/zone-detail-page-client";
+import { ZoneDetailClientPage } from "@/components/zone-detail-page-client";
+import { ZONE_IDS, isZoneId } from "@/lib/zone-meta";
 
 export function generateStaticParams() {
   return ZONE_IDS.map((zoneId) => ({ zoneId }));

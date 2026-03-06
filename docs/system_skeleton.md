@@ -5,7 +5,7 @@
 DB 생성/운영 관련 내용은 `docs/db.md`를 기준으로 관리합니다.
 
 ## Zone -> Code
-- Zone 0 (Raw Data): `apps/orchestrator/src/zones/zone0/ingest.ts` (KIS tick/10호가 + 뉴스/종토방/텔레그램 수집, 버퍼, 이벤트 발행)
+- Zone 0 (Raw Data): `apps/orchestrator/src/zones/zone0/ingest.ts` (KIS tick/10호가 + 동적 심볼풀 + 뉴스/종토방/텔레그램 수집, 버퍼, 이벤트 발행)
 - Zone 1 (Technical): `apps/orchestrator/src/zones/zone1/technical.ts` (1분 spike, 3/5분 MA, imbalance, support/resistance 상태 계산)
 - Zone 2 (Fundamental): `apps/orchestrator/src/zones/zone2/fundamental.ts`, `services/python/zone2_worker.py` (provider/cache/fallback 기반 리스크 필터)
 - Zone 3 (Pattern Match): `apps/orchestrator/src/zones/zone3/pattern.ts`, `services/python/zone3_worker.py` (30분 OHLVC 벡터화 + 코사인 매칭)
@@ -14,7 +14,7 @@ DB 생성/운영 관련 내용은 `docs/db.md`를 기준으로 관리합니다.
 - Zone 6 (History Feedback): `apps/orchestrator/src/zones/zone6/history.ts`, `services/python/zone6_worker.py` (vector 유사 이력 조회 + 청산 결과 아카이브 적재)
 
 ## Runtime Flow
-1. Orchestrator가 1초 주기로 Zone 0 -> 1 -> 2 -> 3 -> 4 -> 6 -> 5 순서로 계산
+1. Orchestrator는 Zone0의 `zone0:raw` 이벤트를 트리거로 Zone 0 -> 1 -> 2 -> 3 -> 4 -> 6 -> 5 순서로 계산
 2. Zone 5 결과를 `BUY/SELL/PASS`로 변환해 가상 주문 체결
 3. 상태 스냅샷을 Socket.io로 대시보드에 push
 4. 대시보드에서 Kill-Switch/Manual Override 명령을 API로 역전송
@@ -46,14 +46,20 @@ DB 생성/운영 관련 내용은 `docs/db.md`를 기준으로 관리합니다.
 
 ## Zone 0 Runtime Details
 - Zone 0 Gateway lifecycle: `createRuntimeState()`에서 생성 후 런타임 동안 재사용
-- Raw frame pull: `stepRuntime()`에서 `zone0.nextFrame()` 호출
+- Raw frame pull: `stepRuntime()`에서 `zone0.consumeFrame()` 호출
+- Trigger: `zone0:raw` 이벤트 발생 시 runtime step 스케줄링
 - EventEmitter channels:
   - `zone1:tick`
   - `zone4:context`
   - `zone0:raw`
 - Buffer API: `GET /api/zone0/buffer`
 - Health summary: `GET /health` 응답에 zone0 buffer metrics 포함
-- Config: `.env`의 `ZONE0_BUFFER_SIZE`로 버퍼 길이 제어
+- Dynamic symbol pool:
+  - KIS 핫리스트 기반 감시 종목 자동 갱신
+  - `updateSymbols()`로 웹소켓 증분 subscribe/unsubscribe 반영
+- Config:
+  - 버퍼/큐: `ZONE0_BUFFER_SIZE`, `ZONE0_FRAME_QUEUE_SIZE`
+  - 심볼풀: `ZONE0_SYMBOL_DISCOVERY_ENABLED`, `ZONE0_SYMBOL_POOL_SIZE`, `ZONE0_SYMBOL_POOL_REFRESH_MS`
 
 ## Zone 1 Runtime Details
 - Zone 1 Engine lifecycle: `createRuntimeState()`에서 생성 후 런타임 동안 재사용

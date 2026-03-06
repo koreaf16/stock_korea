@@ -88,6 +88,7 @@ Node.js(Orchestrator)가 웹소켓으로 쏘아주는 실시간 틱 데이터와
 ### 7.2 Left Panel (Radar)
 * Zone0 버퍼 요약 카드 (News/Telegram 카운트)
 * 실시간 ticker 터미널 + 마지막 frame 시각
+* Zone0 동적 감시풀(핫 종목 Top-N) 상태 표시
 * Zone1 spike ratio 게이지/경보
 * Zone2 provider/source + 리스크 이슈 표시
 
@@ -106,6 +107,7 @@ Node.js(Orchestrator)가 웹소켓으로 쏘아주는 실시간 틱 데이터와
 
 ### 7.5 연동 방식
 * Socket: snapshot 실시간 push
+* Socket: `zone0:raw` 실시간 push
 * Polling: `/health` 3초 주기 갱신
 * API Command: kill-switch/manual-order 실패 시 에러 표시
 

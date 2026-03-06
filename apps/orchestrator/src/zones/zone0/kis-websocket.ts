@@ -45,8 +45,10 @@ export interface KisOrderBook {
 
 export interface KisWebSocketOptions {
   targetSymbol?: string;
+  targetSymbols?: string[];
   reconnectDelayMs?: number;
   logger?: KisLogger;
+  onConnectionStateChange?: (connected: boolean) => void;
   onTick?: (tick: KisExecutionTick) => void;
   onOrderBook?: (orderBook: KisOrderBook) => void;
   onControlMessage?: (payload: unknown) => void;
@@ -65,26 +67,35 @@ export class KisWebSocketClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private stopped = true;
   private connecting = false;
+  private connected = false;
   private approvalKey: string | null = null;
-  private targetSymbol: string;
+  private targetSymbols: string[];
+  private readonly onConnectionStateChange?: (connected: boolean) => void;
   private readonly onTick?: (tick: KisExecutionTick) => void;
   private readonly onOrderBook?: (orderBook: KisOrderBook) => void;
   private readonly onControlMessage?: (payload: unknown) => void;
 
   constructor(options: KisWebSocketOptions = {}) {
     this.env = loadKisEnv();
-    this.targetSymbol = sanitizeSymbol(options.targetSymbol ?? DEFAULT_SYMBOL);
+    const requestedSymbols =
+      options.targetSymbols && options.targetSymbols.length > 0
+        ? options.targetSymbols
+        : [options.targetSymbol ?? DEFAULT_SYMBOL];
+    this.targetSymbols = normalizeSymbolList(requestedSymbols);
     this.reconnectDelayMs = Math.max(500, options.reconnectDelayMs ?? 3_000);
     this.logger = options.logger ?? console;
+    this.onConnectionStateChange = options.onConnectionStateChange;
     this.onTick = options.onTick;
     this.onOrderBook = options.onOrderBook;
     this.onControlMessage = options.onControlMessage;
   }
 
-  public async start(symbol?: string): Promise<void> {
-    // 1) 외부에서 타겟 종목을 주입하면 런타임 타겟을 교체한다.
-    if (symbol) {
-      this.targetSymbol = sanitizeSymbol(symbol);
+  public async start(symbolOrSymbols?: string | string[]): Promise<void> {
+    // 1) 외부에서 타겟 종목(단일/복수)을 주입하면 런타임 감시 목록을 교체한다.
+    if (Array.isArray(symbolOrSymbols) && symbolOrSymbols.length > 0) {
+      this.targetSymbols = normalizeSymbolList(symbolOrSymbols);
+    } else if (typeof symbolOrSymbols === "string" && symbolOrSymbols.trim()) {
+      this.targetSymbols = normalizeSymbolList([symbolOrSymbols]);
     }
 
     this.stopped = false;
@@ -93,6 +104,7 @@ export class KisWebSocketClient {
 
   public async stop(): Promise<void> {
     this.stopped = true;
+    this.setConnected(false);
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -111,18 +123,48 @@ export class KisWebSocketClient {
   }
 
   public getCurrentSymbol(): string {
-    return this.targetSymbol;
+    return this.targetSymbols[0] ?? DEFAULT_SYMBOL;
+  }
+
+  public getCurrentSymbols(): string[] {
+    return [...this.targetSymbols];
+  }
+
+  public isConnected(): boolean {
+    return this.connected;
   }
 
   public async changeSymbol(nextSymbol: string): Promise<void> {
-    this.targetSymbol = sanitizeSymbol(nextSymbol);
+    await this.updateSymbols([nextSymbol]);
+  }
+
+  public async updateSymbols(nextSymbols: string[]): Promise<void> {
+    const normalized = normalizeSymbolList(nextSymbols);
+    const safeSymbols = normalized.length > 0 ? normalized : [DEFAULT_SYMBOL];
+    const previous = new Set(this.targetSymbols);
+    const next = new Set(safeSymbols);
+
+    const toAdd = safeSymbols.filter((symbol) => !previous.has(symbol));
+    const toRemove = this.targetSymbols.filter((symbol) => !next.has(symbol));
+    this.targetSymbols = safeSymbols;
+
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.approvalKey) {
       return;
     }
 
-    // 2) 이미 소켓이 열린 상태면 기존 연결 재사용 + 신규 종목 구독을 추가 전송한다.
-    this.sendSubscribe(this.ws, this.approvalKey, EXECUTION_TR_ID, this.targetSymbol);
-    this.sendSubscribe(this.ws, this.approvalKey, ORDERBOOK_TR_ID, this.targetSymbol);
+    // 2) 이미 소켓이 열린 상태면 증분 구독/해제를 반영한다.
+    for (const symbol of toRemove) {
+      this.sendUnsubscribe(this.ws, this.approvalKey, EXECUTION_TR_ID, symbol);
+      this.sendUnsubscribe(this.ws, this.approvalKey, ORDERBOOK_TR_ID, symbol);
+    }
+    for (const symbol of toAdd) {
+      this.sendSubscribe(this.ws, this.approvalKey, EXECUTION_TR_ID, symbol);
+      this.sendSubscribe(this.ws, this.approvalKey, ORDERBOOK_TR_ID, symbol);
+    }
+
+    this.logger.info(
+      `[KIS][WS] 구독 심볼 갱신 완료: +${toAdd.length} / -${toRemove.length} / total=${this.targetSymbols.length}`
+    );
   }
 
   private async connect(): Promise<void> {
@@ -200,11 +242,14 @@ export class KisWebSocketClient {
       socket.once("open", () => {
         settled = true;
         this.ws = socket;
+        this.setConnected(true);
         this.logger.info(`[KIS][WS] 연결 성공: ${this.env.wsUrl}`);
 
-        // 5) 소켓 연결 직후 실시간 체결(H0STCNT0), 10호가(H0STASP0) 구독 요청을 보낸다.
-        this.sendSubscribe(socket, approvalKey, EXECUTION_TR_ID, this.targetSymbol);
-        this.sendSubscribe(socket, approvalKey, ORDERBOOK_TR_ID, this.targetSymbol);
+        // 5) 소켓 연결 직후 감시 풀 전체에 대해 실시간 체결(H0STCNT0), 10호가(H0STASP0)를 구독한다.
+        for (const symbol of this.targetSymbols) {
+          this.sendSubscribe(socket, approvalKey, EXECUTION_TR_ID, symbol);
+          this.sendSubscribe(socket, approvalKey, ORDERBOOK_TR_ID, symbol);
+        }
         resolve();
       });
 
@@ -218,6 +263,8 @@ export class KisWebSocketClient {
         if (this.ws === socket) {
           this.ws = null;
         }
+        this.setConnected(false);
+        this.approvalKey = null;
         if (!this.stopped) {
           this.scheduleReconnect("socket-close");
         }
@@ -225,6 +272,7 @@ export class KisWebSocketClient {
 
       socket.on("error", (error: Error) => {
         this.logger.error(`[KIS][WS] 소켓 에러: ${error.message}`);
+        this.setConnected(false);
         if (!settled) {
           cleanupBeforeReject(error);
         }
@@ -232,12 +280,30 @@ export class KisWebSocketClient {
     });
   }
 
+  private setConnected(next: boolean): void {
+    if (this.connected === next) {
+      return;
+    }
+    this.connected = next;
+    this.onConnectionStateChange?.(next);
+  }
+
   private sendSubscribe(socket: WebSocket, approvalKey: string, trId: string, symbol: string): void {
+    this.sendControl(socket, approvalKey, "1", trId, symbol);
+    this.logger.info(`[KIS][WS] ${trId} 구독 요청 전송: ${symbol}`);
+  }
+
+  private sendUnsubscribe(socket: WebSocket, approvalKey: string, trId: string, symbol: string): void {
+    this.sendControl(socket, approvalKey, "2", trId, symbol);
+    this.logger.info(`[KIS][WS] ${trId} 구독 해제 요청 전송: ${symbol}`);
+  }
+
+  private sendControl(socket: WebSocket, approvalKey: string, trType: "1" | "2", trId: string, symbol: string): void {
     const payload = {
       header: {
         approval_key: approvalKey,
         custtype: "P",
-        tr_type: "1",
+        tr_type: trType,
         "content-type": "utf-8"
       },
       body: {
@@ -249,7 +315,6 @@ export class KisWebSocketClient {
     };
 
     socket.send(JSON.stringify(payload));
-    this.logger.info(`[KIS][WS] ${trId} 구독 요청 전송: ${symbol}`);
   }
 
   private handleIncomingMessage(rawData: WebSocket.RawData): void {
@@ -260,6 +325,9 @@ export class KisWebSocketClient {
 
     if (text.startsWith("PINGPONG")) {
       this.logger.debug("[KIS][WS] PINGPONG 수신");
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(text);
+      }
       return;
     }
 
@@ -281,8 +349,10 @@ export class KisWebSocketClient {
       return;
     }
 
+    const fallbackSymbol = this.targetSymbols[0] ?? DEFAULT_SYMBOL;
+
     if (trId === EXECUTION_TR_ID) {
-      const tick = parseExecutionPayload(payload, text, this.targetSymbol);
+      const tick = parseExecutionPayload(payload, text, fallbackSymbol);
       if (!tick) {
         return;
       }
@@ -295,7 +365,7 @@ export class KisWebSocketClient {
     }
 
     if (trId === ORDERBOOK_TR_ID) {
-      const orderBook = parseOrderBookPayload(payload, text, this.targetSymbol);
+      const orderBook = parseOrderBookPayload(payload, text, fallbackSymbol);
       if (!orderBook) {
         return;
       }
@@ -473,7 +543,40 @@ function requiredEnv(name: "KIS_APP_KEY" | "KIS_APP_SECRET" | "KIS_WS_URL" | "KI
 
 function sanitizeSymbol(symbol: string): string {
   const trimmed = symbol.trim();
-  return trimmed.length > 0 ? trimmed : DEFAULT_SYMBOL;
+  if (!trimmed) {
+    return DEFAULT_SYMBOL;
+  }
+
+  const digits = trimmed.replace(/[^\d]/g, "");
+  if (digits.length >= 6) {
+    return digits.slice(0, 6);
+  }
+  if (digits.length > 0) {
+    return digits.padStart(6, "0");
+  }
+
+  return DEFAULT_SYMBOL;
+}
+
+function normalizeSymbolList(symbols: string[]): string[] {
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of symbols) {
+    const symbol = sanitizeSymbol(raw);
+    if (seen.has(symbol)) {
+      continue;
+    }
+
+    seen.add(symbol);
+    deduped.push(symbol);
+  }
+
+  if (deduped.length === 0) {
+    deduped.push(DEFAULT_SYMBOL);
+  }
+
+  return deduped;
 }
 
 function buildUrl(baseUrl: string, path: string): string {

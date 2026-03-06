@@ -141,13 +141,13 @@ export function CenterPanel({ snapshot, health, priceSeries, brainLogs }: Center
   const mergedBrainLogs = [...systemLines.map((text) => ({ id: `sys:${text}`, text })), ...brainLogs].slice(0, 36);
 
   return (
-    <div className="grid h-full grid-rows-[1fr_1fr] gap-3">
+    <div className="grid h-full min-w-0 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
       <Panel
         title="전술 차트 (존 1 + 존 3)"
         subtitle="실시간 캔들 / 지지·저항 / 패턴 고스트 오버레이"
-        className="h-full"
+        className="h-full min-w-0"
         rightSlot={
-          <div className="flex items-center gap-2 text-[11px]">
+          <div className="flex flex-wrap items-center justify-end gap-2 text-[11px]">
             <div className="flex items-center gap-1 rounded-full border border-slate-700/80 bg-slate-900/80 p-1">
               <button
                 type="button"
@@ -177,7 +177,7 @@ export function CenterPanel({ snapshot, health, priceSeries, brainLogs }: Center
           </div>
         }
       >
-        <div className="signal-grid relative h-full rounded-xl border border-slate-700/60 bg-slate-950/65 p-3">
+        <div className="signal-grid relative h-full overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950/65 p-3">
           <svg viewBox={`0 0 ${width} ${height}`} className="h-full w-full">
             {[0.2, 0.4, 0.6, 0.8].map((ratio) => {
               const y = height * ratio;
@@ -245,17 +245,17 @@ export function CenterPanel({ snapshot, health, priceSeries, brainLogs }: Center
             </text>
           </svg>
 
-          <div className="absolute left-3 top-3 flex flex-wrap items-center gap-2 text-[11px]">
-            <span className="rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
+          <div className="absolute left-3 top-3 flex max-w-[calc(100%-92px)] flex-wrap items-center gap-2 text-[11px]">
+            <span className="max-w-[160px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
               패턴 {patternClassKo(snapshot.pattern.klass)}
             </span>
-            <span className="rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
+            <span className="max-w-[160px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
               공급원 {sourceKo(health?.zone3.source)}
             </span>
-            <span className="rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
+            <span className="max-w-[140px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
               벡터 {health?.zone3.vectorDim ?? "-"}차원
             </span>
-            <span className="rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
+            <span className="max-w-[140px] truncate rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200">
               급증 {snapshot.technical.spikeRatio.toFixed(1)}%
             </span>
           </div>
@@ -266,17 +266,23 @@ export function CenterPanel({ snapshot, health, priceSeries, brainLogs }: Center
             <span>{fmtPrice(minPrice)}</span>
           </div>
 
-          <div className="absolute bottom-3 left-3 rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-xs text-slate-200">
-            지지선 {snapshot.technical.support.toLocaleString()} / 저항선 {snapshot.technical.resistance.toLocaleString()}
-          </div>
-          <div className="absolute bottom-3 right-3 rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-xs text-slate-200">
-            {viewMode === "1m" ? "1분 차트" : "3분 차트"} | 틱 {health?.tickCount ?? "-"} | 현재가 {snapshot.tick.price.toLocaleString()}
+          <div className="absolute inset-x-3 bottom-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="min-w-0 rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200 sm:max-w-[58%]">
+              <p className="truncate">
+                지지선 {snapshot.technical.support.toLocaleString()} / 저항선 {snapshot.technical.resistance.toLocaleString()}
+              </p>
+            </div>
+            <div className="min-w-0 rounded-md border border-slate-700/80 bg-slate-900/80 px-2 py-1 text-slate-200 sm:max-w-[42%]">
+              <p className="truncate text-right">
+                {viewMode === "1m" ? "1분 차트" : "3분 차트"} | 틱 {health?.tickCount ?? "-"} | 현재가 {snapshot.tick.price.toLocaleString()}
+              </p>
+            </div>
           </div>
         </div>
       </Panel>
 
-      <Panel title="인공지능 브레인 터미널 (존 4 / 5 / 6)" subtitle="광기게이지 + 판단로그 + 유사이력 피드백" className="h-full">
-        <div className="grid h-full grid-cols-1 gap-3 xl:grid-cols-[260px_1fr_290px]">
+      <Panel title="인공지능 브레인 터미널 (존 4 / 5 / 6)" subtitle="광기게이지 + 판단로그 + 유사이력 피드백" className="h-full min-w-0">
+        <div className="grid h-full grid-cols-1 gap-3 2xl:grid-cols-[240px_minmax(0,1fr)_260px]">
           <div className="rounded-xl border border-slate-700/60 bg-slate-900/65 p-3">
             <p className="text-xs uppercase tracking-[0.2em] text-slate-400">존 4 광기 게이지</p>
 

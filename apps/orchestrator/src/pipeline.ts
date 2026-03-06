@@ -1,16 +1,59 @@
 import type {
   ActionOrder,
   DashboardSnapshot,
+  DecisionAction,
   ManualOrderCommand,
   OrderLogEntry,
   OrderSource,
-  Position
+  Position,
+  WatchPoolItem
 } from "@stock/contracts";
 
 import { nowIso, shortId } from "./utils.js";
 import { createRuntimeState, type RuntimeState } from "./state/store.js";
 
+const WATCH_POOL_LIMIT = Math.max(10, Number(process.env.TARGET_WATCH_POOL_LIMIT ?? 20));
+const WATCH_POOL_STALE_MS = Math.max(60_000, Number(process.env.TARGET_WATCH_POOL_STALE_MS ?? 600_000));
+const TARGET_SELECT_SPIKE_THRESHOLD = Number(process.env.TARGET_SELECT_SPIKE_THRESHOLD ?? 300);
+const TARGET_SELECT_VOLUME_POWER_THRESHOLD = Number(process.env.TARGET_SELECT_VOLUME_POWER_THRESHOLD ?? 120);
+const TARGET_PREEMPT_SPIKE_THRESHOLD = Number(process.env.TARGET_PREEMPT_SPIKE_THRESHOLD ?? 500);
+const TARGET_KEEP_MIN_VOLUME_POWER = Number(process.env.TARGET_KEEP_MIN_VOLUME_POWER ?? 100);
+const TARGET_KEEP_MIN_MA_DIVERGENCE = Number(process.env.TARGET_KEEP_MIN_MA_DIVERGENCE ?? 0);
+const TARGET_PASS_STREAK_LIMIT = Math.max(1, Number(process.env.TARGET_PASS_STREAK_LIMIT ?? 3));
+const DEFAULT_TARGET_SYMBOL = "005930";
+
+interface CachedFundamentalInput {
+  symbol: string;
+  foreignNetBuyQty: number;
+  institutionalNetBuyQty: number;
+  shortBalanceQty: number;
+  source: "KOSCOM" | "KRX";
+  timestamp: string;
+}
+
+interface TargetSelectionInput {
+  previousSnapshot: DashboardSnapshot;
+  watchPool: WatchPoolItem[];
+  incomingSymbol: string;
+}
+
+interface TargetSelection {
+  symbol: string;
+  reason: string;
+}
+
+interface TargetManagerState {
+  watchPoolBySymbol: Map<string, WatchPoolItem>;
+  latestTickBySymbol: Map<string, DashboardSnapshot["tick"]>;
+  latestTechnicalBySymbol: Map<string, DashboardSnapshot["technical"]>;
+  latestFundamentalBySymbol: Map<string, CachedFundamentalInput>;
+  passStreakBySymbol: Map<string, number>;
+}
+
+const TARGET_MANAGER: TargetManagerState = createTargetManagerState();
+
 export function initRuntime(): RuntimeState {
+  resetTargetManager();
   return createRuntimeState();
 }
 
@@ -23,16 +66,31 @@ export async function stepRuntime(prev: RuntimeState): Promise<RuntimeState> {
   }
 
   const tickCount = prev.tickCount + 1;
-  const tick = zone0Frame.tick;
-  const symbol = tick.symbol || prevSnapshot.targetSymbol;
-  const latestMarketFlow = zone0Frame.fundamentalData[zone0Frame.fundamentalData.length - 1] ?? null;
+  const incomingTick = zone0Frame.tick;
+  const incomingSymbol = ensureSymbol(incomingTick.symbol, ensureSymbol(prevSnapshot.targetSymbol));
   const nextGlobalContext = zone0Frame.globalContext ?? prevSnapshot.globalContext;
-  const technical = prev.zone1.nextTechnical({
-    tick,
+
+  const incomingTechnical = prev.zone1.nextTechnical({
+    tick: incomingTick,
     orderBook: zone0Frame.orderBook
   });
+
+  ingestTargetSignals(incomingTick, incomingTechnical, zone0Frame.fundamentalData ?? []);
+
+  const watchPool = buildWatchPoolSnapshot(nowIso());
+  const selected = selectTargetSymbol({
+    previousSnapshot: prevSnapshot,
+    watchPool,
+    incomingSymbol
+  });
+
+  const targetSymbol = selected.symbol;
+  const targetTick = resolveTargetTick(targetSymbol, incomingTick, prevSnapshot);
+  const targetTechnical = resolveTargetTechnical(targetSymbol, incomingTechnical, prevSnapshot);
+  const latestMarketFlow = TARGET_MANAGER.latestFundamentalBySymbol.get(targetSymbol) ?? null;
+
   const fundamental = prev.zone2.evaluate({
-    symbol,
+    symbol: targetSymbol,
     previous: prevSnapshot.fundamental,
     tickCount,
     zone0Fundamental: latestMarketFlow
@@ -47,33 +105,38 @@ export async function stepRuntime(prev: RuntimeState): Promise<RuntimeState> {
       : null
   });
   const pattern = prev.zone3.evaluate({
-    symbol,
-    tick,
-    technical
+    symbol: targetSymbol,
+    tick: targetTick,
+    technical: targetTechnical
   });
   const madness = prev.zone4.evaluate({
-    symbol,
-    technical,
+    symbol: targetSymbol,
+    technical: targetTechnical,
     pattern,
     sentimentPulse: zone0Frame.sentimentPulse
   });
   const history = prev.zone6.evaluate({
-    symbol,
+    symbol: targetSymbol,
     pattern,
     madness
   });
 
+  const positionsMarkedWithIncoming = markToMarket(prevSnapshot.positions, incomingTick);
+  const positionsMarked = markToMarket(positionsMarkedWithIncoming, targetTick);
+
   const skeleton: DashboardSnapshot = {
     ...prevSnapshot,
-    targetSymbol: symbol,
+    targetSymbol,
+    targetReason: selected.reason,
+    watchPool,
     globalContext: nextGlobalContext,
-    tick,
-    technical,
+    tick: targetTick,
+    technical: targetTechnical,
     fundamental,
     pattern,
     madness,
     history,
-    positions: markToMarket(prevSnapshot.positions, tick),
+    positions: positionsMarked,
     lastUpdatedAt: nowIso()
   };
 
@@ -95,6 +158,8 @@ export async function stepRuntime(prev: RuntimeState): Promise<RuntimeState> {
   } else {
     snapshotWithDecision = refreshAccountTotals(snapshotWithDecision);
   }
+
+  updatePassStreak(targetSymbol, snapshotWithDecision.decision.action);
   maybeRecordHistoryOutcome(prev, skeleton, snapshotWithDecision, aiOrder);
 
   return {
@@ -150,6 +215,305 @@ export function applyManualOrder(prev: RuntimeState, command: ManualOrderCommand
     ...prev,
     snapshot: executeOrder(prev.snapshot, order, "MANUAL")
   };
+}
+
+function createTargetManagerState(): TargetManagerState {
+  return {
+    watchPoolBySymbol: new Map<string, WatchPoolItem>(),
+    latestTickBySymbol: new Map<string, DashboardSnapshot["tick"]>(),
+    latestTechnicalBySymbol: new Map<string, DashboardSnapshot["technical"]>(),
+    latestFundamentalBySymbol: new Map<string, CachedFundamentalInput>(),
+    passStreakBySymbol: new Map<string, number>()
+  };
+}
+
+function resetTargetManager(): void {
+  TARGET_MANAGER.watchPoolBySymbol.clear();
+  TARGET_MANAGER.latestTickBySymbol.clear();
+  TARGET_MANAGER.latestTechnicalBySymbol.clear();
+  TARGET_MANAGER.latestFundamentalBySymbol.clear();
+  TARGET_MANAGER.passStreakBySymbol.clear();
+}
+
+function ingestTargetSignals(
+  tick: DashboardSnapshot["tick"],
+  technical: DashboardSnapshot["technical"],
+  fundamentals: CachedFundamentalInput[]
+): void {
+  const symbol = normalizeSymbol(tick.symbol);
+  if (!symbol) {
+    return;
+  }
+
+  TARGET_MANAGER.latestTickBySymbol.set(symbol, {
+    ...tick,
+    symbol
+  });
+
+  TARGET_MANAGER.latestTechnicalBySymbol.set(symbol, technical);
+
+  TARGET_MANAGER.watchPoolBySymbol.set(symbol, {
+    symbol,
+    spikeRatio: technical.spikeRatio,
+    volumePower: technical.volumePower,
+    maDivergence: technical.maDivergence,
+    lastPrice: tick.price,
+    updatedAt: technical.updatedAt
+  });
+
+  for (const item of fundamentals) {
+    const fundamentalSymbol = normalizeSymbol(item.symbol);
+    if (!fundamentalSymbol) {
+      continue;
+    }
+
+    TARGET_MANAGER.latestFundamentalBySymbol.set(fundamentalSymbol, {
+      ...item,
+      symbol: fundamentalSymbol
+    });
+  }
+}
+
+function buildWatchPoolSnapshot(now: string): WatchPoolItem[] {
+  const nowMs = Date.parse(now);
+
+  for (const [symbol, item] of TARGET_MANAGER.watchPoolBySymbol.entries()) {
+    const updatedAt = Date.parse(item.updatedAt);
+    if (!Number.isFinite(updatedAt)) {
+      continue;
+    }
+
+    if (nowMs - updatedAt > WATCH_POOL_STALE_MS) {
+      TARGET_MANAGER.watchPoolBySymbol.delete(symbol);
+      TARGET_MANAGER.latestTickBySymbol.delete(symbol);
+      TARGET_MANAGER.latestTechnicalBySymbol.delete(symbol);
+      TARGET_MANAGER.latestFundamentalBySymbol.delete(symbol);
+      TARGET_MANAGER.passStreakBySymbol.delete(symbol);
+    }
+  }
+
+  return [...TARGET_MANAGER.watchPoolBySymbol.values()]
+    .sort((a, b) => {
+      if (b.spikeRatio !== a.spikeRatio) {
+        return b.spikeRatio - a.spikeRatio;
+      }
+      if (b.volumePower !== a.volumePower) {
+        return b.volumePower - a.volumePower;
+      }
+      return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
+    })
+    .slice(0, WATCH_POOL_LIMIT);
+}
+
+function selectTargetSymbol(input: TargetSelectionInput): TargetSelection {
+  const previousTarget = normalizeSymbol(input.previousSnapshot.targetSymbol);
+  const previousReason = input.previousSnapshot.targetReason || "타겟 탐색 대기";
+
+  const preemption = input.watchPool.find(
+    (item) => item.symbol !== previousTarget && item.spikeRatio > TARGET_PREEMPT_SPIKE_THRESHOLD && hasLiveSignal(item.symbol)
+  );
+
+  if (preemption && previousTarget) {
+    return {
+      symbol: preemption.symbol,
+      reason: `강력한 주도주 난입(Spike ${preemption.spikeRatio.toFixed(1)}%)으로 ${previousTarget} -> ${preemption.symbol} 선점 전환`
+    };
+  }
+
+  if (!previousTarget || !hasLiveSignal(previousTarget)) {
+    const qualified = findQualifiedCandidate(input.watchPool, null);
+    const candidate = qualified ?? findFallbackCandidate(input.watchPool, input.incomingSymbol, null);
+    return {
+      symbol: candidate.symbol,
+      reason: qualified
+        ? `수급 폭발(Spike ${candidate.spikeRatio.toFixed(1)}%, VP ${candidate.volumePower.toFixed(1)})로 타겟 선정`
+        : `유효 신호 부족으로 ${candidate.symbol} 관찰 타겟 지정`
+    };
+  }
+
+  const currentMetric = input.watchPool.find((item) => item.symbol === previousTarget) ?? null;
+  const passStreak = TARGET_MANAGER.passStreakBySymbol.get(previousTarget) ?? 0;
+  const momentumLost = !currentMetric || currentMetric.volumePower < TARGET_KEEP_MIN_VOLUME_POWER || currentMetric.maDivergence < TARGET_KEEP_MIN_MA_DIVERGENCE;
+  const passExceeded = passStreak >= TARGET_PASS_STREAK_LIMIT;
+  const positionClosed = wasTargetPositionClosed(input.previousSnapshot, previousTarget);
+
+  if (momentumLost || passExceeded || positionClosed) {
+    const candidate =
+      findQualifiedCandidate(input.watchPool, previousTarget) ??
+      findFallbackCandidate(input.watchPool, input.incomingSymbol, previousTarget);
+
+    if (candidate.symbol !== previousTarget) {
+      if (passExceeded) {
+        return {
+          symbol: candidate.symbol,
+          reason: `Zone5 PASS ${passStreak}회 누적으로 ${previousTarget} -> ${candidate.symbol} 타겟 교체`
+        };
+      }
+
+      if (positionClosed) {
+        return {
+          symbol: candidate.symbol,
+          reason: `포지션 청산 확인으로 ${previousTarget} -> ${candidate.symbol} 타겟 재선정`
+        };
+      }
+
+      const vp = currentMetric?.volumePower ?? 0;
+      const ma = currentMetric?.maDivergence ?? 0;
+      return {
+        symbol: candidate.symbol,
+        reason: `모멘텀 상실(VP ${vp.toFixed(1)}, MA ${ma.toFixed(2)})로 ${previousTarget} -> ${candidate.symbol} 전환`
+      };
+    }
+  }
+
+  return {
+    symbol: previousTarget,
+    reason: previousReason
+  };
+}
+
+function findQualifiedCandidate(watchPool: WatchPoolItem[], excludeSymbol: string | null): WatchPoolItem | null {
+  for (const item of watchPool) {
+    if (excludeSymbol && item.symbol === excludeSymbol) {
+      continue;
+    }
+    if (item.spikeRatio <= TARGET_SELECT_SPIKE_THRESHOLD) {
+      continue;
+    }
+    if (item.volumePower <= TARGET_SELECT_VOLUME_POWER_THRESHOLD) {
+      continue;
+    }
+    if (!hasLiveSignal(item.symbol)) {
+      continue;
+    }
+
+    return item;
+  }
+
+  return null;
+}
+
+function findFallbackCandidate(watchPool: WatchPoolItem[], incomingSymbol: string, excludeSymbol: string | null): WatchPoolItem {
+  for (const item of watchPool) {
+    if (excludeSymbol && item.symbol === excludeSymbol) {
+      continue;
+    }
+    if (hasLiveSignal(item.symbol)) {
+      return item;
+    }
+  }
+
+  const incomingTick = TARGET_MANAGER.latestTickBySymbol.get(incomingSymbol);
+  const incomingTechnical = TARGET_MANAGER.latestTechnicalBySymbol.get(incomingSymbol);
+
+  return {
+    symbol: incomingSymbol,
+    spikeRatio: incomingTechnical?.spikeRatio ?? 0,
+    volumePower: incomingTechnical?.volumePower ?? 0,
+    maDivergence: incomingTechnical?.maDivergence ?? 0,
+    lastPrice: incomingTick?.price ?? 0,
+    updatedAt: incomingTechnical?.updatedAt ?? nowIso()
+  };
+}
+
+function resolveTargetTick(
+  targetSymbol: string,
+  incomingTick: DashboardSnapshot["tick"],
+  previousSnapshot: DashboardSnapshot
+): DashboardSnapshot["tick"] {
+  const incomingSymbol = normalizeSymbol(incomingTick.symbol);
+  if (incomingSymbol && incomingSymbol === targetSymbol) {
+    return {
+      ...incomingTick,
+      symbol: targetSymbol
+    };
+  }
+
+  const cached = TARGET_MANAGER.latestTickBySymbol.get(targetSymbol);
+  if (cached) {
+    return cached;
+  }
+
+  const previousTickSymbol = normalizeSymbol(previousSnapshot.tick.symbol);
+  if (previousTickSymbol && previousTickSymbol === targetSymbol) {
+    return {
+      ...previousSnapshot.tick,
+      symbol: targetSymbol
+    };
+  }
+
+  return {
+    ...incomingTick,
+    symbol: targetSymbol
+  };
+}
+
+function resolveTargetTechnical(
+  targetSymbol: string,
+  incomingTechnical: DashboardSnapshot["technical"],
+  previousSnapshot: DashboardSnapshot
+): DashboardSnapshot["technical"] {
+  const cached = TARGET_MANAGER.latestTechnicalBySymbol.get(targetSymbol);
+  if (cached) {
+    return cached;
+  }
+
+  const previousTickSymbol = normalizeSymbol(previousSnapshot.tick.symbol);
+  if (previousTickSymbol && previousTickSymbol === targetSymbol) {
+    return previousSnapshot.technical;
+  }
+
+  return incomingTechnical;
+}
+
+function hasLiveSignal(symbol: string): boolean {
+  return TARGET_MANAGER.latestTickBySymbol.has(symbol) && TARGET_MANAGER.latestTechnicalBySymbol.has(symbol);
+}
+
+function wasTargetPositionClosed(snapshot: DashboardSnapshot, targetSymbol: string): boolean {
+  const stillHolding = snapshot.positions.some((position) => normalizeSymbol(position.symbol) === targetSymbol);
+  if (stillHolding) {
+    return false;
+  }
+
+  const latestOrder = snapshot.orderLog[0];
+  if (!latestOrder) {
+    return false;
+  }
+
+  return (
+    normalizeSymbol(latestOrder.symbol) === targetSymbol &&
+    latestOrder.side === "SELL" &&
+    latestOrder.status === "FILLED"
+  );
+}
+
+function updatePassStreak(symbol: string, action: DecisionAction): void {
+  const current = TARGET_MANAGER.passStreakBySymbol.get(symbol) ?? 0;
+  if (action === "PASS") {
+    TARGET_MANAGER.passStreakBySymbol.set(symbol, current + 1);
+    return;
+  }
+
+  TARGET_MANAGER.passStreakBySymbol.set(symbol, 0);
+}
+
+function ensureSymbol(raw: string, fallback = DEFAULT_TARGET_SYMBOL): string {
+  return normalizeSymbol(raw) ?? fallback;
+}
+
+function normalizeSymbol(raw: string | undefined | null): string | null {
+  const text = String(raw ?? "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const digits = text.replace(/[^\d]/g, "");
+  if (digits.length < 6) {
+    return null;
+  }
+
+  return digits.slice(0, 6);
 }
 
 function buildOrderFromDecision(snapshot: DashboardSnapshot): ActionOrder | null {

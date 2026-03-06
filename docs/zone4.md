@@ -58,7 +58,7 @@ Node.js Orchestrator에 `Zone4Engine`을 붙여 매 tick마다 아래 순서로 
 * `ZONE4_PYTHON_CMD`
 
 ### 5.6 현재 한계
-* Zone0 실소스(KIS/Naver/Telegram) 연결 전이라 pulse 자체는 mock 기반
+* Zone0 실소스가 연결되어 pulse는 실데이터 기반으로 계산됨 (단, 키 미설정 소스는 비활성)
 * Python worker는 deterministic scoring skeleton 단계
 * 즉, 현재는 인터페이스/운영 플로우 중심 구현
 

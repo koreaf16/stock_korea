@@ -21,19 +21,13 @@ import { formatKrw, formatTs } from "@/lib/format";
 import { decisionActionKo, madnessStageKo, patternClassKo, riskFlagKo, sourceKo } from "@/lib/korean";
 import { useDashboardHealth } from "@/lib/use-dashboard-health";
 import { useDashboardSocket } from "@/lib/use-dashboard-socket";
+import { ZONE_IDS, type ZoneId } from "@/lib/zone-meta";
 import { useDashboardStore } from "@/lib/store";
 
 import { Panel } from "./panel";
 
 const ORCHESTRATOR_URL = process.env.NEXT_PUBLIC_ORCHESTRATOR_URL ?? "http://localhost:5001";
 const POLL_MS = 3000;
-
-export const ZONE_IDS = ["0", "1", "2", "3", "4", "5", "6"] as const;
-export type ZoneId = (typeof ZONE_IDS)[number];
-
-export function isZoneId(value: string): value is ZoneId {
-  return ZONE_IDS.includes(value as ZoneId);
-}
 
 const ZONE_TITLE: Record<ZoneId, string> = {
   "0": "Raw Ingestion",

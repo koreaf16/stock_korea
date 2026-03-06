@@ -1,16 +1,16 @@
 "use client";
 
 import type { OrderSide } from "@stock/contracts";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CenterPanel } from "@/components/center-panel";
 import { LeftPanel } from "@/components/left-panel";
 import { RightPanel } from "@/components/right-panel";
 import { TopBar } from "@/components/top-bar";
-import { ZoneManagementMenu } from "@/components/zone-management-menu";
 import { useDashboardHealth } from "@/lib/use-dashboard-health";
 import { useDashboardSocket } from "@/lib/use-dashboard-socket";
 import { useDashboardStore } from "@/lib/store";
+import { toSymbolCode } from "@/lib/symbol-label";
 
 const ORCHESTRATOR_URL = process.env.NEXT_PUBLIC_ORCHESTRATOR_URL ?? "http://localhost:5001";
 
@@ -51,6 +51,11 @@ export default function DashboardPage() {
   const priceSeries = useDashboardStore((state) => state.priceSeries);
   const tickLogs = useDashboardStore((state) => state.tickLogs);
   const brainLogs = useDashboardStore((state) => state.brainLogs);
+  const targetLogs = useDashboardStore((state) => state.targetLogs);
+  const newsBoardFeed = useDashboardStore((state) => state.newsBoardFeed);
+  const symbolNames = useDashboardStore((state) => state.symbolNames);
+  const mergeSymbolNames = useDashboardStore((state) => state.mergeSymbolNames);
+  const pendingSymbolsRef = useRef<Set<string>>(new Set());
 
   const [busy, setBusy] = useState(false);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -88,8 +93,91 @@ export default function DashboardPage() {
     [snapshot.targetSymbol]
   );
 
+  const symbolCandidates = useMemo(() => {
+    const values: string[] = [
+      snapshot.targetSymbol,
+      snapshot.tick.symbol,
+      snapshot.fundamental.symbol,
+      ...snapshot.watchPool.map((item) => item.symbol),
+      ...snapshot.positions.map((position) => position.symbol),
+      ...snapshot.orderLog.slice(0, 40).map((log) => log.symbol),
+      ...newsBoardFeed.slice(0, 40).map((item) => item.symbol)
+    ];
+
+    const deduped: string[] = [];
+    const seen = new Set<string>();
+    for (const value of values) {
+      const code = toSymbolCode(value);
+      if (!/^\d{6}$/.test(code) || seen.has(code)) {
+        continue;
+      }
+      seen.add(code);
+      deduped.push(code);
+    }
+    return deduped;
+  }, [newsBoardFeed, snapshot.fundamental.symbol, snapshot.orderLog, snapshot.positions, snapshot.targetSymbol, snapshot.tick.symbol, snapshot.watchPool]);
+
+  useEffect(() => {
+    const missing = symbolCandidates.filter((code) => !symbolNames[code] && !pendingSymbolsRef.current.has(code));
+    if (missing.length === 0) {
+      return;
+    }
+
+    for (const code of missing) {
+      pendingSymbolsRef.current.add(code);
+    }
+
+    let cancelled = false;
+
+    const fetchNames = async () => {
+      try {
+        const response = await fetch(`${ORCHESTRATOR_URL}/api/symbol-names?symbols=${missing.join(",")}`, {
+          method: "GET",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          cache: "no-store"
+        });
+
+        if (!response.ok) {
+          return;
+        }
+
+        const payload = (await response.json()) as {
+          ok?: boolean;
+          items?: Array<{ symbol?: string; name?: string }>;
+        };
+        if (cancelled || !Array.isArray(payload.items)) {
+          return;
+        }
+
+        const entries: Record<string, string> = {};
+        for (const item of payload.items) {
+          const code = toSymbolCode(item?.symbol);
+          const name = String(item?.name ?? "").trim();
+          if (!/^\d{6}$/.test(code) || !name) {
+            continue;
+          }
+          entries[code] = name;
+        }
+
+        mergeSymbolNames(entries);
+      } finally {
+        for (const code of missing) {
+          pendingSymbolsRef.current.delete(code);
+        }
+      }
+    };
+
+    void fetchNames();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mergeSymbolNames, symbolCandidates, symbolNames]);
+
   return (
-    <main className="flex h-screen flex-col overflow-hidden bg-slate-950 p-2 text-slate-100">
+    <main className="flex min-h-screen flex-col overflow-y-auto overflow-x-hidden bg-slate-950 p-2 text-slate-100">
       <TopBar
         connected={connected}
         health={health}
@@ -97,15 +185,21 @@ export default function DashboardPage() {
         commandError={commandError}
         snapshot={snapshot}
         busy={busy}
+        newsFeed={newsBoardFeed}
+        symbolNames={symbolNames}
         onToggleKillSwitch={handleToggleKillSwitch}
       />
 
-      <ZoneManagementMenu health={health} />
-
-      <section className="grid min-h-0 flex-1 grid-cols-1 gap-3 xl:grid-cols-[360px_minmax(0,1fr)_420px]">
-        <LeftPanel snapshot={snapshot} health={health} tickLogs={tickLogs} />
-        <CenterPanel snapshot={snapshot} health={health} priceSeries={priceSeries} brainLogs={brainLogs} />
-        <RightPanel snapshot={snapshot} health={health} busy={busy} onManualOrder={handleManualOrder} />
+      <section className="grid grid-cols-1 items-start gap-3 xl:grid-cols-[minmax(300px,340px)_minmax(0,1fr)_minmax(330px,390px)] 2xl:grid-cols-[360px_minmax(0,1fr)_420px]">
+        <div className="min-w-0">
+          <LeftPanel snapshot={snapshot} health={health} tickLogs={tickLogs} targetLogs={targetLogs} symbolNames={symbolNames} />
+        </div>
+        <div className="min-w-0">
+          <CenterPanel snapshot={snapshot} health={health} priceSeries={priceSeries} brainLogs={brainLogs} />
+        </div>
+        <div className="min-w-0">
+          <RightPanel snapshot={snapshot} health={health} busy={busy} onManualOrder={handleManualOrder} symbolNames={symbolNames} />
+        </div>
       </section>
     </main>
   );

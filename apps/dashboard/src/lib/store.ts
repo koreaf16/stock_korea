@@ -12,6 +12,7 @@ const MAX_TICK_LOGS = 36;
 const MAX_BRAIN_LOGS = 24;
 const MAX_FEED_ITEMS = 50;
 const MAX_TELEGRAM_ITEMS = 50;
+const MAX_TARGET_LOGS = 24;
 
 export interface UiLogLine {
   id: string;
@@ -123,6 +124,8 @@ interface DashboardStore {
   connected: boolean;
   health: OrchestratorHealth | null;
   healthError: string | null;
+  logSeq: number;
+  symbolNames: Record<string, string>;
   snapshot: DashboardSnapshot;
   zone0Raw: Zone0RawFrame | null;
   priceDirection: PriceDirection;
@@ -132,9 +135,11 @@ interface DashboardStore {
   priceSeries: number[];
   tickLogs: UiLogLine[];
   brainLogs: UiLogLine[];
+  targetLogs: UiLogLine[];
   setConnected: (connected: boolean) => void;
   setHealth: (health: OrchestratorHealth) => void;
   setHealthError: (error: string | null) => void;
+  mergeSymbolNames: (entries: Record<string, string>) => void;
   setSnapshot: (snapshot: DashboardSnapshot) => void;
   setZone0RawFrame: (frame: Zone0RawFrame) => void;
 }
@@ -143,6 +148,8 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
   connected: false,
   health: null,
   healthError: null,
+  logSeq: 0,
+  symbolNames: {},
   snapshot: createEmptyDashboardSnapshot(),
   zone0Raw: null,
   priceDirection: "FLAT",
@@ -152,6 +159,7 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
   priceSeries: [],
   tickLogs: [],
   brainLogs: [],
+  targetLogs: [],
   setConnected: (connected) => {
     set({ connected });
   },
@@ -161,24 +169,67 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
   setHealthError: (healthError) => {
     set({ healthError });
   },
+  mergeSymbolNames: (entries) => {
+    set((state) => {
+      if (!entries || Object.keys(entries).length === 0) {
+        return state;
+      }
+
+      let changed = false;
+      const next = { ...state.symbolNames };
+
+      for (const [key, value] of Object.entries(entries)) {
+        const symbol = normalizeSymbolCode(key);
+        const name = String(value ?? "").trim();
+        if (!symbol || !name) {
+          continue;
+        }
+        if (next[symbol] === name) {
+          continue;
+        }
+        next[symbol] = name;
+        changed = true;
+      }
+
+      if (!changed) {
+        return state;
+      }
+
+      return {
+        ...state,
+        symbolNames: next
+      };
+    });
+  },
   setSnapshot: (snapshot) => {
     set((state) => {
       if (state.snapshot.lastUpdatedAt === snapshot.lastUpdatedAt) {
         return state;
       }
 
+      const nextLogSeq = state.logSeq + 1;
       const tickLine = `[${formatTs(snapshot.tick.timestamp)}] ${snapshot.tick.symbol} ${formatKrw(snapshot.tick.price)}원 거래량:${formatKrw(snapshot.tick.volume)}`;
       const brainLine = `[${formatTs(snapshot.decision.generatedAt)}] [존5_${decisionActionKo(snapshot.decision.action)}] ${narrativeKo(
         snapshot.decision.reasoning
       )}`;
-      const tickId = `${snapshot.tick.timestamp}:${snapshot.tick.symbol}:${snapshot.tick.price}:${snapshot.tick.volume}`;
-      const brainId = `${snapshot.decision.generatedAt}:${snapshot.decision.decisionId}:${snapshot.decision.action}`;
+      const targetChanged = state.snapshot.targetSymbol !== snapshot.targetSymbol;
+      const reasonChanged = state.snapshot.targetReason !== snapshot.targetReason;
+      const targetLine = `[${formatTs(snapshot.lastUpdatedAt)}] 타겟 ${snapshot.targetSymbol} - ${snapshot.targetReason}`;
+      const tickId = `tick:${nextLogSeq}:${snapshot.tick.timestamp}:${snapshot.tick.symbol}`;
+      const brainId = `brain:${nextLogSeq}:${snapshot.decision.generatedAt}:${snapshot.decision.decisionId}`;
+      const targetId = `target:${nextLogSeq}:${snapshot.lastUpdatedAt}:${snapshot.targetSymbol}`;
+      const nextTargetLogs =
+        targetChanged || reasonChanged
+          ? [{ id: targetId, text: targetLine }, ...state.targetLogs].slice(0, MAX_TARGET_LOGS)
+          : state.targetLogs;
 
       return {
+        logSeq: nextLogSeq,
         snapshot,
         priceSeries: [...state.priceSeries, snapshot.tick.price].slice(-MAX_PRICE_POINTS),
         tickLogs: [{ id: tickId, text: tickLine }, ...state.tickLogs].slice(0, MAX_TICK_LOGS),
-        brainLogs: [{ id: brainId, text: brainLine }, ...state.brainLogs].slice(0, MAX_BRAIN_LOGS)
+        brainLogs: [{ id: brainId, text: brainLine }, ...state.brainLogs].slice(0, MAX_BRAIN_LOGS),
+        targetLogs: nextTargetLogs
       };
     });
   },
@@ -227,3 +278,11 @@ export const useDashboardStore = create<DashboardStore>((set) => ({
     });
   }
 }));
+
+function normalizeSymbolCode(raw: string): string | null {
+  const digits = String(raw ?? "").trim().replace(/[^\d]/g, "");
+  if (digits.length < 6) {
+    return null;
+  }
+  return digits.slice(0, 6);
+}
