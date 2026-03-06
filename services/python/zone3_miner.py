@@ -699,27 +699,27 @@ def extract_daily_events(symbol: str, daily_df: pd.DataFrame) -> list[EventCandi
     df = daily_df.copy()
     df["prev_close"] = df["Close"].shift(1)
     df = df.dropna(subset=["prev_close"])
-    df["pct_change"] = ((df["Close"] - df["prev_close"]) / df["prev_close"]) * 100.0
+    df["high_pct_change"] = ((df["High"] - df["prev_close"]) / df["prev_close"]) * 100.0
+    df["low_pct_change"] = ((df["Low"] - df["prev_close"]) / df["prev_close"]) * 100.0
 
     events: list[EventCandidate] = []
     for row in df.itertuples(index=False):
-        pct = float(row.pct_change)
-        if pct >= EVENT_UP_PCT:
-            events.append(EventCandidate(symbol=symbol, klass="CLASS_A", event_date=row.Date, pct_change=pct))
-        elif pct <= EVENT_DOWN_PCT:
-            events.append(EventCandidate(symbol=symbol, klass="CLASS_C", event_date=row.Date, pct_change=pct))
+        high_pct = float(row.high_pct_change)
+        low_pct = float(row.low_pct_change)
+        if high_pct >= EVENT_UP_PCT:
+            events.append(EventCandidate(symbol=symbol, klass="CLASS_A", event_date=row.Date, pct_change=high_pct))
+        if low_pct <= EVENT_DOWN_PCT:
+            events.append(EventCandidate(symbol=symbol, klass="CLASS_C", event_date=row.Date, pct_change=low_pct))
     return events
 
 
 def find_event_start_index(minute_df: pd.DataFrame, klass: str) -> int:
     if minute_df.empty:
         return -1
-    df = minute_df.copy()
-    df["ret"] = df["close"].pct_change().fillna(0.0)
     if klass == "CLASS_A":
-        idx = int(df["ret"].idxmax())
+        idx = int(minute_df["high"].idxmax())
     else:
-        idx = int(df["ret"].idxmin())
+        idx = int(minute_df["low"].idxmin())
     return idx
 
 
