@@ -3,7 +3,7 @@ import http from "node:http";
 import type { ManualOrderCommand } from "@stock/contracts";
 import { SOCKET_EVENTS } from "@stock/contracts";
 import cors from "cors";
-import express from "express";
+import express, { type Request, type Response } from "express";
 import { Server } from "socket.io";
 
 import { createOraclePersistence } from "./db/oracle-persistence.js";
@@ -38,7 +38,13 @@ let llmHeartbeatAt: string | null = null;
 let llmHeartbeatTimer: NodeJS.Timeout | null = null;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.text({ type: "text/plain" }));
+app.use(
+  express.json({
+    type: ["application/json", "application/*+json"]
+  })
+);
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/health", (_req, res) => {
   runtime = withNetworkHeartbeat(runtime);
@@ -151,6 +157,41 @@ app.get("/api/zone0/buffer", (_req, res) => {
   res.json(runtime.zone0.getBufferSnapshot());
 });
 
+app.get("/api/zone0/config", (_req, res) => {
+  try {
+    const config = runtime.zone0.getConfig();
+    res.json({
+      ok: true,
+      keywords: config.keywords,
+      boardPollMs: config.boardPollMs
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(500).json({
+      ok: false,
+      error: message
+    });
+  }
+});
+
+app.put("/api/zone0/config", (req, res) => {
+  try {
+    const { keywords, boardPollMs } = parseZone0ConfigPayload(req.body);
+    const nextConfig = runtime.zone0.updateConfig(keywords, boardPollMs);
+    res.json({
+      ok: true,
+      keywords: nextConfig.keywords,
+      boardPollMs: nextConfig.boardPollMs
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(400).json({
+      ok: false,
+      error: message
+    });
+  }
+});
+
 app.get("/api/zone1/state", (_req, res) => {
   res.json(runtime.zone1.getStateSnapshot());
 });
@@ -208,21 +249,8 @@ app.post("/api/manual-order", (req, res) => {
   });
 });
 
-app.post("/api/zone0/telegram-webhook", (req, res) => {
-  const item = runtime.zone0.ingestTelegramWebhook(req.body ?? {});
-  if (!item) {
-    res.status(400).json({
-      ok: false,
-      error: "message 또는 text 필드가 필요합니다."
-    });
-    return;
-  }
-
-  res.json({
-    ok: true,
-    id: item.id
-  });
-});
+app.post("/api/zone0/telegram-webhook", handleTelegramWebhook);
+app.post("/api/zone0/webhook/telegram", handleTelegramWebhook);
 
 app.get("/api/zone0/telegram-channels", async (_req, res) => {
   try {
@@ -630,6 +658,110 @@ function toDecisionAction(raw: string): "BUY" | "SELL" | "PASS" {
   return "SELL";
 }
 
+function handleTelegramWebhook(req: Request, res: Response): void {
+  try {
+    const entries = normalizeTelegramWebhookEntries(req.body);
+    const ids: string[] = [];
+    let accepted = 0;
+    let rejected = 0;
+
+    for (const entry of entries) {
+      const item = runtime.zone0.ingestTelegramWebhook(entry);
+      if (!item) {
+        rejected += 1;
+        continue;
+      }
+      accepted += 1;
+      ids.push(item.id);
+    }
+
+    if (accepted === 0) {
+      res.status(400).json({
+        ok: false,
+        accepted,
+        rejected,
+        error: "유효한 텔레그램 메시지를 찾지 못했습니다. message/text/content/caption 필드가 필요합니다."
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      accepted,
+      rejected,
+      id: ids[0],
+      ids
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    res.status(500).json({
+      ok: false,
+      error: message
+    });
+  }
+}
+
+function normalizeTelegramWebhookEntries(raw: unknown): Array<Record<string, unknown>> {
+  const parsed = parseWebhookBody(raw);
+
+  if (Array.isArray(parsed)) {
+    return parsed
+      .map((item) => toObject(item) ?? (typeof item === "string" ? { message: item } : null))
+      .filter((item): item is Record<string, unknown> => item !== null);
+  }
+
+  const obj = toObject(parsed);
+  if (!obj) {
+    return [];
+  }
+
+  const batch = pickBatchArray(obj);
+  if (batch) {
+    return batch
+      .map((item) => toObject(item))
+      .filter((item): item is Record<string, unknown> => item !== null);
+  }
+
+  return [obj];
+}
+
+function parseWebhookBody(raw: unknown): unknown {
+  if (typeof raw !== "string") {
+    return raw;
+  }
+
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return {
+      message: trimmed
+    };
+  }
+}
+
+function pickBatchArray(payload: Record<string, unknown>): unknown[] | null {
+  const keys = ["messages", "items", "updates", "records", "events", "data"];
+  for (const key of keys) {
+    const value = payload[key];
+    if (Array.isArray(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function toObject(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  return raw as Record<string, unknown>;
+}
+
 function parseSymbolsQuery(raw: unknown): string[] {
   const list = Array.isArray(raw) ? raw.join(",") : String(raw ?? "");
   if (!list.trim()) {
@@ -649,6 +781,44 @@ function parseSymbolsQuery(raw: unknown): string[] {
   }
 
   return deduped.slice(0, 40);
+}
+
+function parseZone0ConfigPayload(raw: unknown): { keywords: string[]; boardPollMs: number } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("요청 본문은 JSON 객체여야 합니다.");
+  }
+
+  const body = raw as Record<string, unknown>;
+  const rawKeywords = body.keywords ?? body.newKeywords ?? body.newsKeywords;
+  if (!Array.isArray(rawKeywords)) {
+    throw new Error("keywords 배열이 필요합니다.");
+  }
+
+  const dedupedKeywords: string[] = [];
+  const seenKeywords = new Set<string>();
+  for (const rawKeyword of rawKeywords) {
+    const token = String(rawKeyword ?? "").trim();
+    if (!token || seenKeywords.has(token)) {
+      continue;
+    }
+    seenKeywords.add(token);
+    dedupedKeywords.push(token);
+  }
+
+  const rawBoardPollMs = body.boardPollMs ?? body.newBoardPollMs ?? body.boardPollIntervalMs;
+  if (rawBoardPollMs === undefined || rawBoardPollMs === null || rawBoardPollMs === "") {
+    throw new Error("boardPollMs 값이 필요합니다.");
+  }
+
+  const boardPollMs = Number(rawBoardPollMs);
+  if (!Number.isFinite(boardPollMs) || boardPollMs <= 0) {
+    throw new Error("boardPollMs는 0보다 큰 숫자여야 합니다.");
+  }
+
+  return {
+    keywords: dedupedKeywords,
+    boardPollMs: Math.floor(boardPollMs)
+  };
 }
 
 function normalizeSymbol(raw: string): string | null {

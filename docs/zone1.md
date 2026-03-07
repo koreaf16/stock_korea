@@ -36,7 +36,7 @@ Zone0의 `tick + orderBook`를 입력으로 받아 상태 누적 계산합니다
 ### 5.3 현재 반영된 산출 지표
 문서의 5개 지표를 모두 계산합니다.
 1. **Volume Power**  
-   체결량과 호가 깊이 비중(가격 변동 bias 포함)으로 매수/매도 체결량을 추정해 `buy/sell * 100` 계산
+   KIS 원시 체결강도(`volumePower`)가 존재하면 우선 사용하고, 미수신 시 체결량+호가 깊이 비중(가격 변동 bias 포함) 추정식으로 `buy/sell * 100` 계산
 2. **Spike Ratio**  
    최근 1분 거래대금 합 / 직전 1분 거래대금 합 * 100
 3. **MA Divergence**  
@@ -51,7 +51,7 @@ Zone0의 `tick + orderBook`를 입력으로 받아 상태 누적 계산합니다
 * `GET /health`: zone1 요약(sessionDate/high/low/ma3/ma5) 포함
 
 ### 5.5 현재 한계
-* KIS 원본 필드(매수체결량/매도체결량) 직접 수신 전이라 Volume Power는 추정식 기반
+* KIS 원시 체결강도 미수신 구간에서는 Volume Power가 추정식 fallback으로 계산됨
 * 1초 고정 tick 전제이므로 실시간 가변 지연 환경 보정 로직은 미구현
 
 ### 5.6 DB 매핑 (생성 완료)

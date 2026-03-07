@@ -19,11 +19,10 @@ import { useEffect, useMemo, useState } from "react";
 
 import { formatKrw, formatTs } from "@/lib/format";
 import { decisionActionKo, madnessStageKo, patternClassKo, riskFlagKo, sourceKo } from "@/lib/korean";
-import { useDashboardHealth } from "@/lib/use-dashboard-health";
-import { useDashboardSocket } from "@/lib/use-dashboard-socket";
 import { ZONE_IDS, type ZoneId } from "@/lib/zone-meta";
 import { useDashboardStore } from "@/lib/store";
 
+import { DashboardFrame } from "./dashboard-frame";
 import { Panel } from "./panel";
 
 const ORCHESTRATOR_URL = process.env.NEXT_PUBLIC_ORCHESTRATOR_URL ?? "http://localhost:5001";
@@ -99,10 +98,11 @@ function asArray(obj: unknown, key: string): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
-export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
-  useDashboardSocket();
-  useDashboardHealth();
+function zonePageHref(zoneId: ZoneId): string {
+  return zoneId === "0" ? "/settings/zone0?tab=telegram" : `/zone/${zoneId}`;
+}
 
+export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
   const connected = useDashboardStore((state) => state.connected);
   const health = useDashboardStore((state) => state.health);
   const snapshot = useDashboardStore((state) => state.snapshot);
@@ -266,7 +266,8 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
   };
 
   return (
-    <main className="min-h-screen bg-slate-950 p-2 text-slate-100">
+    <DashboardFrame>
+      <div className="flex-1 min-w-0 overflow-y-auto pr-1 text-slate-100">
       <header className="panel-surface mb-3 rounded-2xl p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
@@ -295,14 +296,14 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
           <Link href="/" className="inline-flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200">
             <ArrowLeft className="h-3.5 w-3.5" /> Dashboard
           </Link>
-          {prevZone ? <Link href={`/zone/${prevZone}`} className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200">Prev Z{prevZone}</Link> : null}
-          {nextZone ? <Link href={`/zone/${nextZone}`} className="inline-flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200">Next Z{nextZone}<ArrowRight className="h-3.5 w-3.5" /></Link> : null}
+          {prevZone ? <Link href={zonePageHref(prevZone)} className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200">Prev Z{prevZone}</Link> : null}
+          {nextZone ? <Link href={zonePageHref(nextZone)} className="inline-flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200">Next Z{nextZone}<ArrowRight className="h-3.5 w-3.5" /></Link> : null}
 
           <div className="ml-auto flex flex-wrap gap-1">
             {ZONE_IDS.map((id) => (
               <Link
                 key={id}
-                href={`/zone/${id}`}
+                href={zonePageHref(id)}
                 className={`rounded border px-2 py-1 text-xs ${id === zoneId ? "border-cyan-400 bg-cyan-500/20 text-cyan-200" : "border-slate-700 bg-slate-900 text-slate-300"}`}
               >
                 Z{id}
@@ -413,7 +414,8 @@ export function ZoneDetailClientPage({ zoneId }: { zoneId: ZoneId }) {
           <span>Decision {decisionActionKo(snapshot.decision.action)}</span>
         </div>
       </footer>
-    </main>
+      </div>
+    </DashboardFrame>
   );
 }
 

@@ -10,8 +10,8 @@
 ## 3. 데이터 소스 및 타겟 (Data Sources)
 1. **실시간 틱/체결 (`H0STCNT0`)**: 한국투자증권(KIS) WebSocket -> Node.js 수신
 2. **실시간 10호가 잔량 (`H0STASP0`)**: 한국투자증권(KIS) WebSocket -> Node.js 수신
-3. **특징주 뉴스 원문**: 네이버 증권 속보 크롤링 (Node.js/cheerio)
-4. **종토방 게시글 원시 JSON**: 네이버 종목토론실 비공식 API 폴링 (Node.js)
+3. **특징주 뉴스 원문**: 네이버 증권 크롤링(Node.js/cheerio) + OpenAPI 보조 수집
+4. **종토방 게시글 원시 JSON**: Naver OpenTalk JSON API 폴링(Node.js, `m.stock.naver.com/front-api/opentalk`) + HTML fallback
 5. **텔레그램 찌라시 원문**: Python Telethon을 통한 정보방 웹훅 수신
 
 ## 4. 입출력 (I/O)
@@ -58,10 +58,10 @@ EventEmitter 기반으로 아래 이벤트를 발행합니다.
 * `GET /health`: `zone0` 버퍼 카운트 요약 포함
 
 ### 5.6 현재 한계
-현재는 외부 연결 mock 단계입니다.
-* KIS WebSocket 실연결(`H0STCNT0`, `H0STASP0`) 미연결
-* Naver 뉴스/종토방 실크롤링 미연결
-* Telethon 웹훅 수신 미연결
+외부 연결은 환경변수/외부 API 상태에 따라 부분 비활성화될 수 있습니다.
+* KIS WebSocket 실연결(`H0STCNT0`, `H0STASP0`)은 자격증명 설정 시 동작
+* Naver 뉴스/종토방은 크롤링/JSON API 기반으로 실수집 동작 (실패 시 재시도/일부 fallback)
+* Telethon 웹훅 수신은 `/api/zone0/webhook/telegram` 엔드포인트로 연동
 
 ### 5.7 DB 매핑 (생성 완료)
 * Raw 이벤트 적재 대상 테이블: `TB_ZONE0_EVENT_RAW`

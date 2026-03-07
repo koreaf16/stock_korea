@@ -140,14 +140,14 @@ export function CenterPanel({ snapshot, health, priceSeries, symbolNames }: Cent
   const [viewMode, setViewMode] = useState<ViewMode>("1m");
 
   return (
-    <div className="relative h-full w-full bg-black">
+    <div className="relative isolate h-full w-full bg-black">
       {/* 1. Main Background Chart */}
-      <div className="absolute inset-0">
+      <div className="absolute inset-0 z-0">
         <TacticalChart snapshot={snapshot} health={health} priceSeries={priceSeries} viewMode={viewMode} />
       </div>
 
       {/* 2. Cyberpunk HUD Overlay (Minimal) */}
-      <div className="pointer-events-none absolute left-6 top-6 z-10 flex gap-6">
+      <div className="pointer-events-none absolute left-6 top-6 z-20 flex gap-6">
         <div className="border-l-2 border-cyan-500 pl-3">
           <p className="text-[9px] tracking-[0.3em] text-cyan-500 mb-1">TARGET_LOCK</p>
           <p className="text-2xl font-light tracking-wider text-white">
@@ -163,9 +163,9 @@ export function CenterPanel({ snapshot, health, priceSeries, symbolNames }: Cent
       </div>
 
       {/* View Mode Toggles */}
-      <div className="pointer-events-auto absolute right-6 bottom-6 flex gap-2">
-        <button onClick={() => setViewMode("1m")} className={`px-3 py-1 text-[10px] uppercase tracking-widest border transition-colors ${viewMode === "1m" ? "border-cyan-500/50 text-cyan-400 bg-cyan-500/10" : "border-zinc-800 text-zinc-500 hover:text-zinc-300"}`}>1 MIN</button>
-        <button onClick={() => setViewMode("3m")} className={`px-3 py-1 text-[10px] uppercase tracking-widest border transition-colors ${viewMode === "3m" ? "border-cyan-500/50 text-cyan-400 bg-cyan-500/10" : "border-zinc-800 text-zinc-500 hover:text-zinc-300"}`}>3 MIN</button>
+      <div className="pointer-events-auto absolute right-6 top-6 z-30 flex gap-2">
+        <button type="button" onClick={() => setViewMode("1m")} className={`px-3 py-1 text-[10px] uppercase tracking-widest border backdrop-blur-[1px] transition-colors ${viewMode === "1m" ? "border-cyan-500/50 text-cyan-400 bg-cyan-500/10" : "border-zinc-800 text-zinc-500 hover:text-zinc-300"}`}>1 MIN</button>
+        <button type="button" onClick={() => setViewMode("3m")} className={`px-3 py-1 text-[10px] uppercase tracking-widest border backdrop-blur-[1px] transition-colors ${viewMode === "3m" ? "border-cyan-500/50 text-cyan-400 bg-cyan-500/10" : "border-zinc-800 text-zinc-500 hover:text-zinc-300"}`}>3 MIN</button>
       </div>
     </div>
   );

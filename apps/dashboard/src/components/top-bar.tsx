@@ -8,9 +8,13 @@ import type { OrchestratorHealth } from "@/lib/orchestrator-health";
 interface TopBarProps {
   connected: boolean;
   health: OrchestratorHealth | null;
+  healthError?: string | null;
+  commandError?: string | null;
   snapshot: DashboardSnapshot;
   busy: boolean;
   onToggleKillSwitch: (enabled: boolean) => Promise<void>;
+  newsFeed?: unknown[];
+  symbolNames?: Record<string, string>;
   emergencyAlerts?: string[];
 }
 
@@ -41,9 +45,10 @@ export function TopBar({ connected, health, snapshot, busy, onToggleKillSwitch, 
         {/* ZONE NAVIGATION BUTTONS */}
         <div className="ml-2 flex items-center gap-1 border-l border-zinc-800/80 pl-4">
           {[0, 1, 2, 3, 4, 5, 6].map((z) => (
+            // Zone0 is now managed via the dedicated settings screen.
             <Link
               key={z}
-              href={`/zone/${z}`}
+              href={z === 0 ? "/settings/zone0?tab=telegram" : `/zone/${z}`}
               className="rounded border border-transparent px-1.5 py-0.5 text-[9px] font-bold text-zinc-500 transition-all hover:border-zinc-700 hover:bg-zinc-900 hover:text-cyan-400"
             >
               Z{z}
@@ -62,11 +67,11 @@ export function TopBar({ connected, health, snapshot, busy, onToggleKillSwitch, 
       <div className="flex items-center gap-5">
         <div className="flex items-center gap-3 text-[10px] tracking-wider hidden sm:flex">
           <span className="text-zinc-600">
-            ASSET: <span className="text-zinc-200 font-bold">{formatKrw(snapshot.account.totalAsset)}</span>
+            ASSET: <span className="text-zinc-200 font-bold">{formatKrw(snapshot.account.totalAssets)}</span>
           </span>
           <span className="text-zinc-600">
-            PNL: <span className={`font-bold ${snapshot.account.realizedPnl >= 0 ? "text-cyan-400" : "text-rose-500"}`}>
-              {formatKrw(snapshot.account.realizedPnl)}
+            PNL%: <span className={`font-bold ${snapshot.account.realizedPnlPct >= 0 ? "text-cyan-400" : "text-rose-500"}`}>
+              {snapshot.account.realizedPnlPct >= 0 ? "+" : ""}{snapshot.account.realizedPnlPct.toFixed(2)}%
             </span>
           </span>
         </div>

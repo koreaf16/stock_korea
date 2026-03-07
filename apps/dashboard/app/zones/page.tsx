@@ -1,3 +1,5 @@
+"use client";
+
 import {
   Bot,
   Brain,
@@ -9,6 +11,8 @@ import {
   MessageSquareWarning
 } from "lucide-react";
 import Link from "next/link";
+
+import { DashboardFrame } from "@/components/dashboard-frame";
 
 const ZONES = [
   {
@@ -57,46 +61,49 @@ const ZONES = [
 
 export default function ZoneMenuPage() {
   return (
-    <main className="min-h-screen bg-slate-950 px-3 py-4 text-slate-100">
-      <section className="mx-auto w-full max-w-5xl rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-        <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
-          <div>
-            <p className="text-[11px] uppercase tracking-[0.24em] text-slate-400">Zone Navigation</p>
-            <h1 className="mt-1 text-lg font-semibold text-slate-100">존별 관리 메뉴</h1>
-            <p className="mt-1 text-xs text-slate-400">필요한 존만 눌러서 해당 상세 화면으로 이동합니다.</p>
-          </div>
-          <Link
-            href="/"
-            className="rounded-lg border border-slate-700/80 bg-slate-900 px-3 py-1.5 text-xs text-slate-200 transition hover:bg-slate-800"
-          >
-            대시보드로 복귀
-          </Link>
-        </header>
+    <DashboardFrame>
+      <div className="flex-1 min-w-0 overflow-y-auto pr-1">
+        <section className="mx-auto w-full max-w-5xl rounded-2xl border border-zinc-800/60 bg-black/70 p-4">
+          <header className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 pb-3">
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.24em] text-zinc-500">Zone Navigation</p>
+              <h1 className="mt-1 text-lg font-semibold text-zinc-100">존별 관리 메뉴</h1>
+              <p className="mt-1 text-xs text-zinc-400">메인 대시보드 템플릿 기준으로 존 화면을 관리합니다.</p>
+            </div>
+            <Link
+              href="/"
+              className="rounded-lg border border-zinc-700/80 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-200 transition hover:border-cyan-500/60 hover:text-cyan-300"
+            >
+              대시보드로 복귀
+            </Link>
+          </header>
 
-        <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-          {ZONES.map((zone) => {
-            const Icon = zone.icon;
-            return (
-              <Link
-                key={zone.id}
-                href={`/zone/${zone.id}`}
-                className="group rounded-xl border border-slate-800 bg-slate-950/80 p-3 transition hover:border-cyan-500/50 hover:bg-cyan-500/5"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <Icon className="mt-0.5 h-4 w-4 text-cyan-300" />
-                    <p className="text-sm font-semibold text-slate-100">
-                      Z{zone.id} {zone.title}
-                    </p>
+          <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+            {ZONES.map((zone) => {
+              const Icon = zone.icon;
+              const href = zone.id === "0" ? "/settings/zone0?tab=telegram" : `/zone/${zone.id}`;
+              return (
+                <Link
+                  key={zone.id}
+                  href={href}
+                  className="group rounded-xl border border-zinc-800/70 bg-black p-3 transition hover:border-cyan-500/50 hover:bg-cyan-500/5"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Icon className="mt-0.5 h-4 w-4 text-cyan-300" />
+                      <p className="text-sm font-semibold text-zinc-100">
+                        Z{zone.id} {zone.title}
+                      </p>
+                    </div>
+                    <ChevronRight className="h-4 w-4 text-zinc-500 transition group-hover:text-cyan-300" />
                   </div>
-                  <ChevronRight className="h-4 w-4 text-slate-500 transition group-hover:text-cyan-300" />
-                </div>
-                <p className="mt-2 text-xs text-slate-400">{zone.subtitle}</p>
-              </Link>
-            );
-          })}
-        </div>
-      </section>
-    </main>
+                  <p className="mt-2 text-xs text-zinc-400">{zone.subtitle}</p>
+                </Link>
+              );
+            })}
+          </div>
+        </section>
+      </div>
+    </DashboardFrame>
   );
 }

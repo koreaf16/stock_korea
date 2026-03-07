@@ -57,6 +57,7 @@ export interface Zone0Tick {
   symbol: string;
   price: number;
   volume: number;
+  volumePower?: number;
   bidDepth: number;
   askDepth: number;
   timestamp: string;

@@ -16,7 +16,9 @@ const DEFAULT_SYMBOL = sanitizeSymbol(process.env.ZONE0_TARGET_SYMBOL ?? "005930
 const MAX_BUFFER_SIZE = Math.max(100, Number(process.env.ZONE0_BUFFER_SIZE ?? 600));
 const MAX_FRAME_QUEUE_SIZE = Math.max(10, Number(process.env.ZONE0_FRAME_QUEUE_SIZE ?? 3_000));
 const EXTERNAL_POLL_MS = clamp(Number(process.env.ZONE0_EXTERNAL_POLL_MS ?? 60_000), 60_000, 300_000);
-const BOARD_POLL_MS = clamp(Number(process.env.ZONE0_BOARD_POLL_MS ?? 20_000), 10_000, 60_000);
+const DEFAULT_BOARD_POLL_MS = 20_000;
+const MIN_BOARD_POLL_MS = 10_000;
+const MAX_BOARD_POLL_MS = 60_000;
 const MARKET_FLOW_POLL_MS = clamp(Number(process.env.ZONE0_MARKET_FLOW_POLL_MS ?? 60_000), 30_000, 300_000);
 const MACRO_POLL_MS = clamp(Number(process.env.ZONE0_MACRO_POLL_MS ?? 1_800_000), 300_000, 3_600_000);
 const SYMBOL_POOL_REFRESH_MS = clamp(Number(process.env.ZONE0_SYMBOL_POOL_REFRESH_MS ?? 60_000), 30_000, 300_000);
@@ -24,7 +26,6 @@ const SYMBOL_POOL_SIZE = clamp(Number(process.env.ZONE0_SYMBOL_POOL_SIZE ?? 12),
 const SEEN_KEY_LIMIT = Math.max(1_000, Number(process.env.ZONE0_SEEN_KEY_LIMIT ?? 20_000));
 const NAVER_REQUEST_TIMEOUT_MS = Math.max(2_000, Number(process.env.ZONE0_NAVER_TIMEOUT_MS ?? 8_000));
 const KIS_HOTLIST_TIMEOUT_MS = Math.max(2_000, Number(process.env.ZONE0_KIS_HOTLIST_TIMEOUT_MS ?? 10_000));
-const NEWS_KEYWORDS = parseCsv(process.env.ZONE0_NEWS_KEYWORDS ?? "");
 const SYMBOL_DISCOVERY_ENABLED = parseBool(process.env.ZONE0_SYMBOL_DISCOVERY_ENABLED, true);
 const KIS_REST_URL = String(process.env.KIS_REST_URL ?? "").trim();
 const KIS_APP_KEY = String(process.env.KIS_APP_KEY ?? "").trim();
@@ -63,14 +64,40 @@ interface KisAccessTokenResponse {
   expires_in?: number | string;
 }
 
+interface NaverOpenTalkChannelInfoResponse {
+  result?: unknown;
+}
+
+interface NaverOpenTalkRecentMessagesResponse {
+  result?: unknown;
+}
+
+interface NaverOpenTalkMessage {
+  content: string;
+  nickname: string;
+  createTimeRaw: string;
+  timestamp: string;
+}
+
 const NAVER_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   Referer: "https://finance.naver.com/"
 };
+const NAVER_MOBILE_HEADERS = {
+  ...NAVER_HEADERS,
+  Referer: "https://m.stock.naver.com/"
+};
+const NAVER_OPENTALK_BASE_URL = "https://m.stock.naver.com/front-api/opentalk";
+const BOARD_TITLE_MAX_LENGTH = 88;
 
 const POSITIVE_HINTS = ["상승", "강세", "매수", "급등", "호재", "돌파", "수주", "확대", "회복", "신고가"];
 const NEGATIVE_HINTS = ["하락", "약세", "매도", "급락", "악재", "경고", "축소", "우려", "불안", "루머"];
+const TELEGRAM_TEXT_KEYS = ["message", "text", "content", "caption", "body", "raw_text", "rawText"];
+const TELEGRAM_SYMBOL_KEYS = ["symbol", "ticker", "code", "stockCode", "stock_code", "itemCode", "item_code"];
+const TELEGRAM_PRIORITY_KEYS = ["priority", "level", "importance", "urgency"];
+const TELEGRAM_SENTIMENT_KEYS = ["sentimentHint", "sentiment", "score", "sentiment_score"];
+const TELEGRAM_TIMESTAMP_KEYS = ["timestamp", "ts", "createdAt", "created_at", "date", "eventTime", "event_time"];
 
 export type Zone0Source =
   | "KIS_H0STCNT0"
@@ -154,11 +181,12 @@ export interface Zone0TelegramMessage {
 }
 
 export interface Zone0TelegramWebhookPayload {
-  symbol?: string;
-  message?: string;
-  text?: string;
-  priority?: string;
-  sentimentHint?: number;
+  symbol?: unknown;
+  message?: unknown;
+  text?: unknown;
+  priority?: unknown;
+  sentimentHint?: unknown;
+  [key: string]: unknown;
 }
 
 export interface Zone0SentimentPulse {
@@ -198,6 +226,11 @@ export interface Zone0RealtimeStatus {
   watchSymbols: string[];
 }
 
+export interface Zone0IngestConfig {
+  keywords: string[];
+  boardPollMs: number;
+}
+
 export interface Zone0Gateway {
   emitter: EventEmitter;
   start: (params?: { targetSymbol?: string }) => Promise<void>;
@@ -206,6 +239,8 @@ export interface Zone0Gateway {
   consumeFrame: () => Zone0Frame | null;
   hasPendingFrame: () => boolean;
   ingestTelegramWebhook: (payload: Zone0TelegramWebhookPayload) => Zone0TelegramMessage | null;
+  getConfig: () => Zone0IngestConfig;
+  updateConfig: (newKeywords: string[], newBoardPollMs: number) => Zone0IngestConfig;
   getBufferSnapshot: () => Zone0BufferSnapshot;
   getRealtimeStatus: () => Zone0RealtimeStatus;
 }
@@ -258,6 +293,12 @@ export function createZone0Gateway(): Zone0Gateway {
   let pollingBoard = false;
   let pollingMarketFlow = false;
   let pollingMacro = false;
+  let dynamicNewsKeywords = normalizeKeywordArray(parseCsv(process.env.ZONE0_NEWS_KEYWORDS ?? ""));
+  let dynamicBoardPollMs = clamp(
+    Number(process.env.ZONE0_BOARD_POLL_MS ?? DEFAULT_BOARD_POLL_MS),
+    MIN_BOARD_POLL_MS,
+    MAX_BOARD_POLL_MS
+  );
   let warnedSymbolPoolDisabled = false;
   let warnedNaverDisabled = false;
   let warnedDartDisabled = false;
@@ -619,6 +660,7 @@ export function createZone0Gateway(): Zone0Gateway {
     symbol: string;
     price: number;
     volume: number;
+    volumePower?: number;
     receivedAt: string;
   }): void {
     const symbol = sanitizeSymbol(rawTick.symbol || currentSymbol);
@@ -629,6 +671,7 @@ export function createZone0Gateway(): Zone0Gateway {
       symbol,
       price: Math.max(1, Math.floor(rawTick.price)),
       volume: Math.max(0, Math.floor(rawTick.volume)),
+      volumePower: Number.isFinite(rawTick.volumePower) ? Number(rawTick.volumePower) : undefined,
       bidDepth: latestBook?.totalBidDepth ?? 0,
       askDepth: latestBook?.totalAskDepth ?? 0,
       timestamp
@@ -651,7 +694,7 @@ export function createZone0Gateway(): Zone0Gateway {
     pollingNews = true;
 
     try {
-      const keywords = resolveNaverNewsKeywords(symbol);
+      const keywords = resolveNaverNewsKeywords(symbol, dynamicNewsKeywords);
       const articles = await naverNewsClient.fetchLatestByKeywords(keywords);
       if (articles.length === 0) {
         return;
@@ -686,6 +729,44 @@ export function createZone0Gateway(): Zone0Gateway {
     } finally {
       pollingNews = false;
     }
+  }
+
+  function getConfig(): Zone0IngestConfig {
+    return {
+      keywords: [...dynamicNewsKeywords],
+      boardPollMs: dynamicBoardPollMs
+    };
+  }
+
+  function restartBoardTimer(): void {
+    if (boardTimer) {
+      clearInterval(boardTimer);
+      boardTimer = null;
+    }
+    if (!started) {
+      return;
+    }
+
+    boardTimer = setInterval(() => {
+      void pollNaverBoard(pickRoundRobinSymbol());
+    }, dynamicBoardPollMs);
+  }
+
+  function updateConfig(newKeywords: string[], newBoardPollMs: number): Zone0IngestConfig {
+    const parsedPollMs = Number(newBoardPollMs);
+    if (!Number.isFinite(parsedPollMs) || parsedPollMs <= 0) {
+      throw new Error("boardPollMs must be a positive number.");
+    }
+
+    dynamicNewsKeywords = normalizeKeywordArray(newKeywords);
+    dynamicBoardPollMs = clamp(Math.floor(parsedPollMs), MIN_BOARD_POLL_MS, MAX_BOARD_POLL_MS);
+    restartBoardTimer();
+
+    const snapshot = getConfig();
+    console.info(
+      `[zone0][config] updated keywords=${snapshot.keywords.join(",")} boardPollMs=${snapshot.boardPollMs}`
+    );
+    return snapshot;
   }
 
   async function pollDartDisclosures(symbol: string): Promise<void> {
@@ -801,6 +882,113 @@ export function createZone0Gateway(): Zone0Gateway {
     }
   }
 
+  async function pollNaverBoardFromJsonApi(symbol: string): Promise<Zone0BoardPost[]> {
+    const channelInfoUrl = `${NAVER_OPENTALK_BASE_URL}/channelInfo?code=${encodeURIComponent(symbol)}`;
+    const channelInfoResponse = await runWithRetry(
+      () =>
+        axios.get<NaverOpenTalkChannelInfoResponse>(channelInfoUrl, {
+          headers: NAVER_MOBILE_HEADERS,
+          timeout: NAVER_REQUEST_TIMEOUT_MS
+        }),
+      {
+        context: `naver-board-opentalk:channel:${symbol}`
+      }
+    );
+
+    const channelResult = asRecord(channelInfoResponse.data?.result);
+    const channelId = String(channelResult?.channelId ?? "").trim();
+
+    let messages = normalizeOpenTalkMessages(channelResult?.filteredRecentMessages);
+    if (messages.length === 0) {
+      messages = normalizeOpenTalkMessages(channelResult?.recentMessages);
+    }
+
+    if (messages.length === 0 && channelId) {
+      const recentMessagesUrl = `${NAVER_OPENTALK_BASE_URL}/recentMessages?channelId=${encodeURIComponent(channelId)}`;
+      const recentMessagesResponse = await runWithRetry(
+        () =>
+          axios.get<NaverOpenTalkRecentMessagesResponse>(recentMessagesUrl, {
+            headers: NAVER_MOBILE_HEADERS,
+            timeout: NAVER_REQUEST_TIMEOUT_MS
+          }),
+        {
+          context: `naver-board-opentalk:recent:${symbol}`
+        }
+      );
+      messages = normalizeOpenTalkMessages(recentMessagesResponse.data?.result);
+    }
+
+    const discovered: Zone0BoardPost[] = [];
+    for (const message of messages) {
+      const dedupeKey = `${symbol}|${message.createTimeRaw}|${message.nickname}|${message.content}`;
+      if (seenBefore(boardSeen, boardSeenQueue, dedupeKey, SEEN_KEY_LIMIT)) {
+        continue;
+      }
+
+      const content = message.nickname ? `[${message.nickname}] ${message.content}` : message.content;
+      discovered.push({
+        id: shortId("BOARD"),
+        symbol,
+        title: toBoardTitle(message.content),
+        content,
+        sentimentHint: estimateSentimentHint(content),
+        source: "NAVER_BOARD",
+        timestamp: message.timestamp
+      });
+    }
+
+    return discovered;
+  }
+
+  async function pollNaverBoardFromHtml(symbol: string): Promise<Zone0BoardPost[]> {
+    const url = `https://finance.naver.com/item/board.naver?code=${encodeURIComponent(symbol)}&page=1`;
+    const response = await runWithRetry(
+      () =>
+        axios.get<string>(url, {
+          headers: NAVER_HEADERS,
+          responseType: "text",
+          timeout: NAVER_REQUEST_TIMEOUT_MS
+        }),
+      {
+        context: `naver-board-html:${symbol}`
+      }
+    );
+
+    const $ = loadHtml(response.data);
+    const rows = $("table.type2 tr").toArray();
+    const discovered: Zone0BoardPost[] = [];
+
+    for (const row of rows) {
+      const anchor = $(row).find("td.title a").first();
+      if (anchor.length === 0) {
+        continue;
+      }
+
+      const title = normalizeWhitespace(anchor.text());
+      if (!title) {
+        continue;
+      }
+
+      const dateText = normalizeWhitespace($(row).find("td span.tah").first().text());
+      const dedupeKey = `${symbol}|${title}|${dateText}`;
+      if (seenBefore(boardSeen, boardSeenQueue, dedupeKey, SEEN_KEY_LIMIT)) {
+        continue;
+      }
+
+      discovered.push({
+        id: shortId("BOARD"),
+        symbol,
+        title: toBoardTitle(title),
+        content: title,
+        sentimentHint: estimateSentimentHint(title),
+        source: "NAVER_BOARD",
+        timestamp: nowIso()
+      });
+    }
+
+    return discovered;
+  }
+
   async function pollNaverBoard(symbol: string): Promise<void> {
     if (pollingBoard) {
       return;
@@ -808,49 +996,17 @@ export function createZone0Gateway(): Zone0Gateway {
     pollingBoard = true;
 
     try {
-      const url = `https://finance.naver.com/item/board.naver?code=${encodeURIComponent(symbol)}&page=1`;
-      const response = await runWithRetry(
-        () =>
-          axios.get<string>(url, {
-            headers: NAVER_HEADERS,
-            responseType: "text",
-            timeout: NAVER_REQUEST_TIMEOUT_MS
-          }),
-        {
-          context: `naver-board:${symbol}`
-        }
-      );
+      let discovered: Zone0BoardPost[] = [];
 
-      const $ = loadHtml(response.data);
-      const rows = $("table.type2 tr").toArray();
-      const discovered: Zone0BoardPost[] = [];
+      try {
+        discovered = await pollNaverBoardFromJsonApi(symbol);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[zone0][board] JSON API polling failed, fallback to HTML: ${message}`);
+      }
 
-      for (const row of rows) {
-        const anchor = $(row).find("td.title a").first();
-        if (anchor.length === 0) {
-          continue;
-        }
-
-        const title = anchor.text().trim();
-        if (!title) {
-          continue;
-        }
-
-        const dateText = $(row).find("td span.tah").first().text().trim();
-        const dedupeKey = `${symbol}|${title}|${dateText}`;
-        if (seenBefore(boardSeen, boardSeenQueue, dedupeKey, SEEN_KEY_LIMIT)) {
-          continue;
-        }
-
-        discovered.push({
-          id: shortId("BOARD"),
-          symbol,
-          title,
-          content: title,
-          sentimentHint: estimateSentimentHint(title),
-          source: "NAVER_BOARD",
-          timestamp: nowIso()
-        });
+      if (discovered.length === 0) {
+        discovered = await pollNaverBoardFromHtml(symbol);
       }
 
       if (discovered.length === 0) {
@@ -889,7 +1045,7 @@ export function createZone0Gateway(): Zone0Gateway {
 
     if (!naverNewsClient.isEnabled && !warnedNaverDisabled) {
       warnedNaverDisabled = true;
-      console.warn("[zone0][news] NAVER_CLIENT_ID 또는 NAVER_CLIENT_SECRET 미설정으로 뉴스 수집이 비활성화됩니다.");
+      console.warn("[zone0][news] NAVER 뉴스 수집 경로(OPEN API/크롤링)가 비활성화되어 뉴스 수집이 중지됩니다.");
     }
     if (!dartDisclosureClient.isEnabled && !warnedDartDisabled) {
       warnedDartDisabled = true;
@@ -917,9 +1073,7 @@ export function createZone0Gateway(): Zone0Gateway {
     externalTimer = setInterval(() => {
       void pollExternalFeeds(pickRoundRobinSymbol());
     }, EXTERNAL_POLL_MS);
-    boardTimer = setInterval(() => {
-      void pollNaverBoard(pickRoundRobinSymbol());
-    }, BOARD_POLL_MS);
+    restartBoardTimer();
     marketFlowTimer = setInterval(() => {
       void pollMarketFlow(pickRoundRobinSymbol());
     }, MARKET_FLOW_POLL_MS);
@@ -1000,20 +1154,25 @@ export function createZone0Gateway(): Zone0Gateway {
   }
 
   function ingestTelegramWebhook(payload: Zone0TelegramWebhookPayload): Zone0TelegramMessage | null {
-    const message = String(payload.message ?? payload.text ?? "").trim();
+    const candidates = collectTelegramPayloadCandidates(payload);
+    const message = extractTelegramWebhookText(candidates);
     if (!message) {
       return null;
     }
 
-    const symbol = sanitizeSymbol(payload.symbol ?? currentSymbol);
+    const symbolRaw = extractTelegramWebhookString(candidates, TELEGRAM_SYMBOL_KEYS);
+    const sentimentRaw = extractTelegramWebhookNumber(candidates, TELEGRAM_SENTIMENT_KEYS);
+    const priorityRaw = extractTelegramWebhookString(candidates, TELEGRAM_PRIORITY_KEYS);
+    const timestampRaw = extractTelegramWebhookValue(candidates, TELEGRAM_TIMESTAMP_KEYS);
+    const symbol = sanitizeSymbol(symbolRaw ?? currentSymbol);
     const telegramMessage: Zone0TelegramMessage = {
       id: shortId("TG"),
       symbol,
       message,
-      sentimentHint: normalizeSentimentHint(payload.sentimentHint, message),
-      priority: normalizePriority(payload.priority),
+      sentimentHint: normalizeSentimentHint(sentimentRaw, message),
+      priority: normalizePriority(priorityRaw ?? undefined),
       source: "TELEGRAM",
-      timestamp: nowIso()
+      timestamp: normalizeWebhookTimestamp(timestampRaw)
     };
 
     pushBuffered(telegramMessages, telegramMessage, MAX_BUFFER_SIZE);
@@ -1031,6 +1190,8 @@ export function createZone0Gateway(): Zone0Gateway {
     consumeFrame: () => frameQueue.shift() ?? null,
     hasPendingFrame: () => frameQueue.length > 0,
     ingestTelegramWebhook,
+    getConfig,
+    updateConfig,
     getRealtimeStatus: () => ({
       kisConnected: kisRealtimeConnected,
       primarySymbol: currentSymbol,
@@ -1219,6 +1380,109 @@ function toExplicitSymbol(value: string | undefined): string | null {
   return null;
 }
 
+function collectTelegramPayloadCandidates(payload: Zone0TelegramWebhookPayload): Record<string, unknown>[] {
+  const root = toRecord(payload);
+  if (!root) {
+    return [];
+  }
+
+  const candidates: Record<string, unknown>[] = [root];
+  const nestedKeys = ["data", "payload", "event", "update", "messageData", "telegram", "body", "message"];
+
+  for (const key of nestedKeys) {
+    const nested = toRecord(root[key]);
+    if (nested) {
+      candidates.push(nested);
+    }
+  }
+
+  return candidates;
+}
+
+function extractTelegramWebhookText(candidates: Record<string, unknown>[]): string {
+  return extractTelegramWebhookString(candidates, TELEGRAM_TEXT_KEYS) ?? "";
+}
+
+function extractTelegramWebhookString(candidates: Record<string, unknown>[], keys: string[]): string | null {
+  const value = extractTelegramWebhookValue(candidates, keys);
+  return toTrimmedString(value);
+}
+
+function extractTelegramWebhookNumber(candidates: Record<string, unknown>[], keys: string[]): number | undefined {
+  const value = extractTelegramWebhookValue(candidates, keys);
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function extractTelegramWebhookValue(candidates: Record<string, unknown>[], keys: string[]): unknown {
+  for (const candidate of candidates) {
+    for (const key of keys) {
+      const value = candidate[key];
+      if (value !== undefined && value !== null) {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+function toTrimmedString(raw: unknown): string | null {
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return String(raw);
+  }
+
+  return null;
+}
+
+function toRecord(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  return raw as Record<string, unknown>;
+}
+
+function normalizeWebhookTimestamp(raw: unknown): string {
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return nowIso();
+    }
+
+    const parsedFromString = Date.parse(trimmed);
+    if (Number.isFinite(parsedFromString)) {
+      return new Date(parsedFromString).toISOString();
+    }
+
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      return normalizeWebhookTimestamp(numeric);
+    }
+
+    return nowIso();
+  }
+
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    const ms = raw > 1_000_000_000_000 ? raw : raw * 1_000;
+    return new Date(ms).toISOString();
+  }
+
+  return nowIso();
+}
+
 function sanitizeSymbol(symbol: string): string {
   const raw = String(symbol ?? "").trim();
   if (!raw) {
@@ -1290,9 +1554,83 @@ function estimateDisclosureSentiment(disclosure: DartImpactDisclosure): number {
   return Number(clamp(score, -1, 1).toFixed(2));
 }
 
-function resolveNaverNewsKeywords(symbol: string): string[] {
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function normalizeOpenTalkMessages(raw: unknown): NaverOpenTalkMessage[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  const parsed: NaverOpenTalkMessage[] = [];
+  for (const entry of raw) {
+    const record = asRecord(entry);
+    if (!record) {
+      continue;
+    }
+
+    const content = normalizeWhitespace(String(record.content ?? ""));
+    if (!content) {
+      continue;
+    }
+
+    const nickname = normalizeWhitespace(String(record.nickname ?? ""));
+    const createTimeRaw = String(record.createTime ?? "").trim();
+    parsed.push({
+      content,
+      nickname,
+      createTimeRaw,
+      timestamp: toIsoFromUnknownTimestamp(record.createTime)
+    });
+  }
+
+  return parsed;
+}
+
+function toIsoFromUnknownTimestamp(raw: unknown): string {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    const millis = raw > 10_000_000_000 ? raw : raw * 1_000;
+    return new Date(millis).toISOString();
+  }
+
+  const text = String(raw ?? "").trim();
+  if (!text) {
+    return nowIso();
+  }
+
+  const asNumber = Number(text);
+  if (Number.isFinite(asNumber) && asNumber > 0) {
+    const millis = asNumber > 10_000_000_000 ? asNumber : asNumber * 1_000;
+    return new Date(millis).toISOString();
+  }
+
+  const normalized = text.replace(/\./g, "-").replace(/\s+/g, " ");
+  const parsed = new Date(normalized.includes("T") ? normalized : normalized.replace(" ", "T"));
+  if (Number.isNaN(parsed.getTime())) {
+    return nowIso();
+  }
+  return parsed.toISOString();
+}
+
+function toBoardTitle(value: string): string {
+  const normalized = normalizeWhitespace(value);
+  if (normalized.length <= BOARD_TITLE_MAX_LENGTH) {
+    return normalized;
+  }
+  return `${normalized.slice(0, BOARD_TITLE_MAX_LENGTH - 3)}...`;
+}
+
+function normalizeWhitespace(value: string): string {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function resolveNaverNewsKeywords(symbol: string, keywords: string[]): string[] {
   const normalizedSymbol = sanitizeSymbol(symbol);
-  const set = new Set<string>(NEWS_KEYWORDS);
+  const set = new Set<string>(normalizeKeywordArray(keywords));
   set.add(normalizedSymbol);
   return [...set];
 }
@@ -1302,6 +1640,28 @@ function parseCsv(value: string): string[] {
     .split(",")
     .map((token) => token.trim())
     .filter(Boolean);
+}
+
+function normalizeKeywordArray(values: string[]): string[] {
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of values) {
+    const tokens = String(raw ?? "")
+      .split(",")
+      .map((token) => token.trim())
+      .filter(Boolean);
+
+    for (const token of tokens) {
+      if (seen.has(token)) {
+        continue;
+      }
+      seen.add(token);
+      deduped.push(token);
+    }
+  }
+
+  return deduped;
 }
 
 function parseBool(raw: string | undefined, fallback: boolean): boolean {

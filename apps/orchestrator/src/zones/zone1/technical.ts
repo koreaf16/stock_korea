@@ -63,6 +63,8 @@ export interface Zone1StateSnapshot {
   notionalPrev1m: number;
   ma3: number;
   ma5: number;
+  lastVolumePower: number;
+  lastVolumePowerSource: "KIS_RAW" | "ESTIMATED" | "NONE";
 }
 
 export interface Zone1Engine {
@@ -81,6 +83,8 @@ export function createZone1Engine(): Zone1Engine {
   let sessionHigh = 0;
   let sessionLow = 0;
   let prevPrice: number | null = null;
+  let lastVolumePower = 0;
+  let lastVolumePowerSource: "KIS_RAW" | "ESTIMATED" | "NONE" = "NONE";
 
   function resetSession(dateKey: string, openPrice: number): void {
     sessionDate = dateKey;
@@ -88,6 +92,8 @@ export function createZone1Engine(): Zone1Engine {
     sessionHigh = openPrice;
     sessionLow = openPrice;
     prevPrice = null;
+    lastVolumePower = 0;
+    lastVolumePowerSource = "NONE";
 
     notionalRecent1m.clear();
     notionalPrev1m.clear();
@@ -116,7 +122,8 @@ export function createZone1Engine(): Zone1Engine {
     ma5Window.push(tick.price);
 
     const orderImbalance = orderBook.totalAskDepth / Math.max(1, orderBook.totalBidDepth);
-    const volumePower = deriveVolumePower(tick, orderBook, prevPrice);
+    const volumePowerResult = deriveVolumePower(tick, orderBook, prevPrice);
+    const volumePower = volumePowerResult.value;
 
     const spikeRatio =
       notionalPrev1m.size > 0 ? (notionalRecent1m.sum / Math.max(1, notionalPrev1m.sum)) * 100 : 100;
@@ -132,9 +139,11 @@ export function createZone1Engine(): Zone1Engine {
     const resistance = Math.round(Math.max(support + 1, 2 * pivot - sessionLow));
 
     prevPrice = tick.price;
+    lastVolumePower = Number(clamp(volumePower, 10, 400).toFixed(2));
+    lastVolumePowerSource = volumePowerResult.source;
 
     return {
-      volumePower: Number(clamp(volumePower, 10, 400).toFixed(2)),
+      volumePower: lastVolumePower,
       spikeRatio: Number(clamp(spikeRatio, 1, 1_200).toFixed(2)),
       maDivergence: Number(clamp(maDivergence, -20, 20).toFixed(2)),
       orderImbalance: Number(clamp(orderImbalance, 0.1, 10).toFixed(2)),
@@ -154,17 +163,33 @@ export function createZone1Engine(): Zone1Engine {
       notionalRecent1m: Number(notionalRecent1m.sum.toFixed(2)),
       notionalPrev1m: Number(notionalPrev1m.sum.toFixed(2)),
       ma3: Number((ma3Window.avg || 0).toFixed(2)),
-      ma5: Number((ma5Window.avg || 0).toFixed(2))
+      ma5: Number((ma5Window.avg || 0).toFixed(2)),
+      lastVolumePower,
+      lastVolumePowerSource
     })
   };
 }
 
-function deriveVolumePower(tick: Zone0Tick, orderBook: Zone0OrderBook, prevPrice: number | null): number {
+function deriveVolumePower(
+  tick: Zone0Tick,
+  orderBook: Zone0OrderBook,
+  prevPrice: number | null
+): { value: number; source: "KIS_RAW" | "ESTIMATED" } {
+  if (typeof tick.volumePower === "number" && Number.isFinite(tick.volumePower) && tick.volumePower > 0) {
+    return {
+      value: tick.volumePower,
+      source: "KIS_RAW"
+    };
+  }
+
   const totalDepth = orderBook.totalAskDepth + orderBook.totalBidDepth;
   const bidDepthRatio = totalDepth > 0 ? orderBook.totalBidDepth / totalDepth : 0.5;
   const priceBias = prevPrice === null ? 0 : tick.price >= prevPrice ? 0.12 : -0.12;
   const buyVolume = tick.volume * clamp(bidDepthRatio + priceBias, 0.08, 0.92);
   const sellVolume = Math.max(1, tick.volume - buyVolume);
 
-  return (buyVolume / sellVolume) * 100;
+  return {
+    value: (buyVolume / sellVolume) * 100,
+    source: "ESTIMATED"
+  };
 }

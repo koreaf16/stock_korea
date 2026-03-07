@@ -9,17 +9,35 @@ import { clamp, nowIso } from "../../utils.js";
 
 type Zone4Provider = "AUTO" | "PYTHON" | "LOCAL";
 type Zone4Source = "PYTHON" | "LOCAL";
+const SIGNAL_WINDOW_MS = 60_000;
+const PYTHON_PROBE_TIMEOUT_MS = 1_200;
 
 interface PythonWorkerResult {
   score: number;
-  stage: "STAGE_1" | "STAGE_2" | "STAGE_3";
+  stage?: "STAGE_1" | "STAGE_2" | "STAGE_3";
   sentiment: number;
   news_velocity: number;
 }
 
+interface Zone4ScoredResult {
+  score: number;
+  sentiment: number;
+  newsVelocity: number;
+}
+
 interface Zone4EngineResult {
-  output: Zone4Madness;
+  output: Zone4ScoredResult;
   source: Zone4Source;
+}
+
+interface PythonExecCommand {
+  command: string;
+  prefixArgs: string[];
+}
+
+interface SignalSample {
+  atMs: number;
+  signalCount: number;
 }
 
 export interface Zone4StateSnapshot {
@@ -48,10 +66,11 @@ export function createZone4Engine(): Zone4Engine {
   const stage2Threshold = Math.max(25, Number(process.env.ZONE4_STAGE2_THRESHOLD ?? 55));
   const stage3Threshold = Math.max(stage2Threshold + 5, Number(process.env.ZONE4_STAGE3_THRESHOLD ?? 75));
   const emaAlpha = clamp(Number(process.env.ZONE4_EMA_ALPHA ?? 0.35), 0.05, 1);
+  const workerPath = resolveZone4WorkerPath();
+  const pythonExec = parsePythonCommand(process.env.ZONE4_PYTHON_CMD ?? "python");
+  const pythonEnabled = Boolean(provider !== "LOCAL" && workerPath && pythonExec && canRunPythonCommand(pythonExec));
 
-  const signalWindow = new Array<number>(60).fill(0);
-  let signalIndex = 0;
-  let signalCount = 0;
+  const signalWindow: SignalSample[] = [];
   let signalSum = 0;
 
   let emaScore: number | null = null;
@@ -60,28 +79,55 @@ export function createZone4Engine(): Zone4Engine {
   let lastStage: Zone4Madness["stage"] | null = null;
   let lastUpdatedAt: string | null = null;
 
+  function pruneSignalWindow(nowMs: number): void {
+    const cutoff = nowMs - SIGNAL_WINDOW_MS;
+    while (signalWindow.length > 0) {
+      const oldest = signalWindow[0];
+      if (!oldest || oldest.atMs >= cutoff) {
+        break;
+      }
+      signalWindow.shift();
+      signalSum -= oldest.signalCount;
+    }
+    if (signalSum < 0) {
+      signalSum = 0;
+    }
+  }
+
+  function updateSignalWindow(nextSignalCount: number, nowMs: number): void {
+    pruneSignalWindow(nowMs);
+    const safeSignalCount = Math.max(0, nextSignalCount);
+    signalWindow.push({
+      atMs: nowMs,
+      signalCount: safeSignalCount
+    });
+    signalSum += safeSignalCount;
+    pruneSignalWindow(nowMs);
+  }
+
+  function getSignalRate1m(nowMs: number): number {
+    pruneSignalWindow(nowMs);
+    return signalSum;
+  }
+
   function evaluate(input: {
     symbol: string;
     technical: Zone1Technical;
     pattern: Zone3PatternMatch;
     sentimentPulse?: Zone0SentimentPulse;
   }): Zone4Madness {
+    const nowMs = Date.now();
+    const pulseSignalCount = Math.max(0, input.sentimentPulse?.signalCount ?? 0);
+    updateSignalWindow(pulseSignalCount, nowMs);
+    const signalRate1m = getSignalRate1m(nowMs);
+
     const local = evaluateLocal(
       input.technical,
       input.pattern,
       input.sentimentPulse,
-      stage2Threshold,
-      stage3Threshold,
       emaAlpha,
+      signalRate1m,
       {
-        getSignalRate: () => getSignalRate1m(signalSum, signalCount),
-        updateSignal: (value: number) => {
-          const prevValue = signalWindow[signalIndex] ?? 0;
-          signalWindow[signalIndex] = value;
-          signalIndex = (signalIndex + 1) % signalWindow.length;
-          signalCount = Math.min(signalWindow.length, signalCount + 1);
-          signalSum = signalSum - prevValue + value;
-        },
         getEma: () => emaScore,
         setEma: (value: number) => {
           emaScore = value;
@@ -90,19 +136,31 @@ export function createZone4Engine(): Zone4Engine {
     );
 
     let finalResult: Zone4EngineResult = local;
-    if (provider === "PYTHON" || provider === "AUTO") {
-      const pythonResult = evaluatePython(input.symbol, input.technical, input.pattern, local.output);
+    if ((provider === "PYTHON" || provider === "AUTO") && pythonEnabled && workerPath && pythonExec) {
+      const pythonResult = evaluatePython(input.symbol, input.technical, input.pattern, local.output, {
+        workerPath,
+        pythonExec
+      });
       if (pythonResult) {
         finalResult = pythonResult;
       }
     }
 
-    lastSource = finalResult.source;
-    lastScore = finalResult.output.score;
-    lastStage = finalResult.output.stage;
-    lastUpdatedAt = finalResult.output.updatedAt;
+    const score = Number(clamp(finalResult.output.score, 0, 100).toFixed(2));
+    const output: Zone4Madness = {
+      score,
+      stage: deriveStage(score, stage2Threshold, stage3Threshold),
+      sentiment: Number(clamp(finalResult.output.sentiment, -1, 1).toFixed(2)),
+      newsVelocity: Number(clamp(finalResult.output.newsVelocity, 0, 100).toFixed(2)),
+      updatedAt: nowIso()
+    };
 
-    return finalResult.output;
+    lastSource = finalResult.source;
+    lastScore = output.score;
+    lastStage = output.stage;
+    lastUpdatedAt = output.updatedAt;
+
+    return output;
   }
 
   return {
@@ -112,7 +170,7 @@ export function createZone4Engine(): Zone4Engine {
       source: lastSource,
       stage2Threshold,
       stage3Threshold,
-      signalRate1m: Number(getSignalRate1m(signalSum, signalCount).toFixed(2)),
+      signalRate1m: Number(getSignalRate1m(Date.now()).toFixed(2)),
       lastScore,
       lastStage,
       lastUpdatedAt
@@ -124,21 +182,15 @@ function evaluateLocal(
   technical: Zone1Technical,
   pattern: Zone3PatternMatch,
   sentimentPulse: Zone0SentimentPulse | undefined,
-  stage2Threshold: number,
-  stage3Threshold: number,
   emaAlpha: number,
+  signalRate1m: number,
   runtime: {
-    updateSignal: (value: number) => void;
-    getSignalRate: () => number;
     getEma: () => number | null;
     setEma: (value: number) => void;
   }
 ): Zone4EngineResult {
   const sentiment = clamp(sentimentPulse?.score ?? 0, -1, 1);
   const pulseVelocity = clamp(sentimentPulse?.velocity ?? 0, 0, 100);
-  const signalCount = Math.max(0, sentimentPulse?.signalCount ?? 0);
-  runtime.updateSignal(signalCount);
-  const signalRate1m = runtime.getSignalRate();
 
   const spikeNorm = clamp((technical.spikeRatio - 80) / 320, 0, 1);
   const volumeNorm = clamp((technical.volumePower - 70) / 220, 0, 1);
@@ -159,17 +211,12 @@ function evaluateLocal(
   const smoothed = prevEma === null ? rawScore : prevEma * (1 - emaAlpha) + rawScore * emaAlpha;
   runtime.setEma(smoothed);
 
-  const score = Number(clamp(smoothed, 0, 100).toFixed(2));
-  const stage = deriveStage(score, stage2Threshold, stage3Threshold);
-
   return {
     source: "LOCAL",
     output: {
-      score,
-      stage,
+      score: smoothed,
       sentiment: Number(sentiment.toFixed(2)),
-      newsVelocity: Number(clamp(pulseVelocity * 0.75 + signalRate1m * 0.25, 0, 100).toFixed(2)),
-      updatedAt: nowIso()
+      newsVelocity: Number(clamp(pulseVelocity * 0.75 + signalRate1m * 0.25, 0, 100).toFixed(2))
     }
   };
 }
@@ -178,24 +225,17 @@ function evaluatePython(
   symbol: string,
   technical: Zone1Technical,
   pattern: Zone3PatternMatch,
-  local: Zone4Madness
+  local: Zone4ScoredResult,
+  options: {
+    workerPath: string;
+    pythonExec: PythonExecCommand;
+  }
 ): Zone4EngineResult | null {
-  const scriptPath = resolveZone4WorkerPath();
-  if (!scriptPath) {
-    return null;
-  }
-
-  const rawCmd = (process.env.ZONE4_PYTHON_CMD ?? "python").trim();
-  const [pythonCmd, ...prefixArgs] = rawCmd.split(/\s+/);
-  if (!pythonCmd) {
-    return null;
-  }
-
   const proc = spawnSync(
-    pythonCmd,
+    options.pythonExec.command,
     [
-      ...prefixArgs,
-      scriptPath,
+      ...options.pythonExec.prefixArgs,
+      options.workerPath,
       "--symbol",
       symbol,
       "--spike-ratio",
@@ -231,11 +271,9 @@ function evaluatePython(
   return {
     source: "PYTHON",
     output: {
-      score: Number(clamp(parsed.score, 0, 100).toFixed(2)),
-      stage: parsed.stage,
-      sentiment: Number(clamp(parsed.sentiment, -1, 1).toFixed(2)),
-      newsVelocity: Number(clamp(parsed.news_velocity, 0, 100).toFixed(2)),
-      updatedAt: nowIso()
+      score: parsed.score,
+      sentiment: parsed.sentiment,
+      newsVelocity: parsed.news_velocity
     }
   };
 }
@@ -250,11 +288,32 @@ function deriveStage(score: number, stage2Threshold: number, stage3Threshold: nu
   return "STAGE_1";
 }
 
-function getSignalRate1m(signalSum: number, signalCount: number): number {
-  if (signalCount === 0) {
-    return 0;
+function parsePythonCommand(raw: string): PythonExecCommand | null {
+  const commandLine = String(raw ?? "").trim();
+  if (!commandLine) {
+    return null;
   }
-  return signalSum * (60 / signalCount);
+
+  const [command, ...prefixArgs] = commandLine.split(/\s+/);
+  if (!command) {
+    return null;
+  }
+
+  return {
+    command,
+    prefixArgs
+  };
+}
+
+function canRunPythonCommand(exec: PythonExecCommand): boolean {
+  const probe = spawnSync(exec.command, [...exec.prefixArgs, "--version"], {
+    encoding: "utf8",
+    timeout: PYTHON_PROBE_TIMEOUT_MS
+  });
+  if (probe.error) {
+    return false;
+  }
+  return probe.status === 0;
 }
 
 function resolveZone4WorkerPath(): string | null {

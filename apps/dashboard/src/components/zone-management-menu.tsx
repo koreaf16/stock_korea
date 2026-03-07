@@ -60,6 +60,10 @@ const ZONE_ROUTE_ID: Record<ZoneKey, string> = {
   zone6: "6"
 };
 
+function zoneDetailHref(zone: ZoneKey): string {
+  return zone === "zone0" ? "/settings/zone0?tab=telegram" : `/zone/${ZONE_ROUTE_ID[zone]}`;
+}
+
 function createInitialZoneStates(): Record<ZoneKey, ZonePayloadState> {
   return ZONE_KEYS.reduce(
     (acc, zone) => {
@@ -425,7 +429,7 @@ export function ZoneManagementMenu({ health }: ZoneManagementMenuProps) {
                   API 열기
                 </a>
                 <Link
-                  href={`/zone/${ZONE_ROUTE_ID[activeZone]}`}
+                  href={zoneDetailHref(activeZone)}
                   className="rounded-md border border-cyan-500/50 bg-cyan-500/10 px-2 py-1 text-xs text-cyan-200 hover:bg-cyan-500/20"
                 >
                   상세 페이지
