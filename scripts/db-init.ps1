@@ -1,6 +1,7 @@
 param(
   [string]$EnvFile = ".env.local",
-  [string]$SqlFile = "db/oracle/init_schema.sql"
+  [string]$SqlFile = "db/oracle/init_schema.sql",
+  [string]$AdditionalSqlFile = "db/oracle/step1_integrated_vector_schema.sql"
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,6 +11,10 @@ if (-not (Test-Path -LiteralPath $EnvFile)) {
 }
 if (-not (Test-Path -LiteralPath $SqlFile)) {
   throw "SQL file not found: $SqlFile"
+}
+if ($AdditionalSqlFile -and -not (Test-Path -LiteralPath $AdditionalSqlFile)) {
+  Write-Output "[db-init] additional SQL not found, skip: $AdditionalSqlFile"
+  $AdditionalSqlFile = ""
 }
 
 Get-Content -LiteralPath $EnvFile | ForEach-Object {
@@ -32,13 +37,21 @@ if (-not $sqlplusPath) {
 }
 
 $fullSqlPath = (Resolve-Path -LiteralPath $SqlFile).Path
+$additionalSqlPath = $null
+if ($AdditionalSqlFile) {
+  $additionalSqlPath = (Resolve-Path -LiteralPath $AdditionalSqlFile).Path
+}
 $wrapperPath = Join-Path $PWD ".tmp_db_init_wrapper.sql"
-$wrapper = @"
-whenever sqlerror exit sql.sqlcode;
-connect $env:ORACLE_USER/$env:ORACLE_PASSWORD@$env:ORACLE_CONNECTION_STRING
-@$fullSqlPath
-exit;
-"@
+$wrapperLines = @(
+  "whenever sqlerror exit sql.sqlcode;",
+  "connect $env:ORACLE_USER/$env:ORACLE_PASSWORD@$env:ORACLE_CONNECTION_STRING",
+  "@$fullSqlPath"
+)
+if ($additionalSqlPath) {
+  $wrapperLines += "@$additionalSqlPath"
+}
+$wrapperLines += "exit;"
+$wrapper = $wrapperLines -join "`n"
 Set-Content -LiteralPath $wrapperPath -Value $wrapper -Encoding ascii
 
 try {

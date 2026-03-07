@@ -78,6 +78,14 @@ export type FundamentalRiskFlag = "CLEAR" | "BLOCKED";
 export interface Zone2Fundamental {
   symbol: string;
   riskFlag: FundamentalRiskFlag;
+  riskScore: number;
+  ruleRiskScore: number;
+  vectorRiskScore: number;
+  similarPumpScore: number;
+  similarDelistScore: number;
+  disclosureToxicityScore: number;
+  vectorLatencyMs: number;
+  safeMode: boolean;
   issues: string[];
   checkedAt: string;
 }
@@ -251,6 +259,14 @@ export function createEmptyDashboardSnapshot(): DashboardSnapshot {
     fundamental: {
       symbol: "UNKNOWN",
       riskFlag: "BLOCKED",
+      riskScore: 1,
+      ruleRiskScore: 1,
+      vectorRiskScore: 1,
+      similarPumpScore: 0,
+      similarDelistScore: 1,
+      disclosureToxicityScore: 1,
+      vectorLatencyMs: 0,
+      safeMode: true,
       issues: ["실데이터 대기"],
       checkedAt: now
     },

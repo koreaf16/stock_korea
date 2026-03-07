@@ -217,6 +217,88 @@ end;
 declare
   v_count number := 0;
 begin
+  select count(*)
+    into v_count
+    from user_tab_cols
+   where table_name = 'TB_ZONE2_FUNDAMENTAL'
+     and column_name = 'DISCLOSURE_VECTOR';
+
+  if v_count = 0 then
+    execute immediate 'alter table TB_ZONE2_FUNDAMENTAL add (DISCLOSURE_VECTOR vector(768, FLOAT32))';
+    dbms_output.put_line('added column TB_ZONE2_FUNDAMENTAL.DISCLOSURE_VECTOR');
+  else
+    dbms_output.put_line('column TB_ZONE2_FUNDAMENTAL.DISCLOSURE_VECTOR already exists');
+  end if;
+end;
+/
+
+declare
+  v_count number := 0;
+begin
+  select count(*)
+    into v_count
+    from user_tab_cols
+   where table_name = 'TB_ZONE2_FUNDAMENTAL'
+     and column_name = 'FINANCIAL_SIGNATURE_VECTOR';
+
+  if v_count = 0 then
+    execute immediate 'alter table TB_ZONE2_FUNDAMENTAL add (FINANCIAL_SIGNATURE_VECTOR vector(16, FLOAT32))';
+    dbms_output.put_line('added column TB_ZONE2_FUNDAMENTAL.FINANCIAL_SIGNATURE_VECTOR');
+  else
+    dbms_output.put_line('column TB_ZONE2_FUNDAMENTAL.FINANCIAL_SIGNATURE_VECTOR already exists');
+  end if;
+end;
+/
+
+declare
+  v_count number := 0;
+begin
+  select count(*) into v_count from user_indexes where index_name = 'IX_Z2_DISCLOSURE_VEC';
+  if v_count = 0 then
+    begin
+      execute immediate q'[
+        create vector index IX_Z2_DISCLOSURE_VEC
+        on TB_ZONE2_FUNDAMENTAL(DISCLOSURE_VECTOR)
+        organization inmemory neighbor graph
+        distance cosine
+      ]';
+      dbms_output.put_line('created vector index IX_Z2_DISCLOSURE_VEC');
+    exception
+      when others then
+        dbms_output.put_line('skip IX_Z2_DISCLOSURE_VEC: ' || sqlerrm);
+    end;
+  else
+    dbms_output.put_line('index IX_Z2_DISCLOSURE_VEC already exists');
+  end if;
+end;
+/
+
+declare
+  v_count number := 0;
+begin
+  select count(*) into v_count from user_indexes where index_name = 'IX_Z2_FIN_SIG_VEC';
+  if v_count = 0 then
+    begin
+      execute immediate q'[
+        create vector index IX_Z2_FIN_SIG_VEC
+        on TB_ZONE2_FUNDAMENTAL(FINANCIAL_SIGNATURE_VECTOR)
+        organization inmemory neighbor graph
+        distance cosine
+      ]';
+      dbms_output.put_line('created vector index IX_Z2_FIN_SIG_VEC');
+    exception
+      when others then
+        dbms_output.put_line('skip IX_Z2_FIN_SIG_VEC: ' || sqlerrm);
+    end;
+  else
+    dbms_output.put_line('index IX_Z2_FIN_SIG_VEC already exists');
+  end if;
+end;
+/
+
+declare
+  v_count number := 0;
+begin
   select count(*) into v_count from user_tables where table_name = 'TB_ZONE3_PATTERN_LIBRARY';
   if v_count = 0 then
     execute immediate q'[

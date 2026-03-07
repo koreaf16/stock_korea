@@ -1,4 +1,5 @@
 import http from "node:http";
+import { spawn, type ChildProcess } from "node:child_process";
 
 import type { ManualOrderCommand } from "@stock/contracts";
 import { SOCKET_EVENTS } from "@stock/contracts";
@@ -36,6 +37,9 @@ let rerunRequested = false;
 let llmConnected = false;
 let llmHeartbeatAt: string | null = null;
 let llmHeartbeatTimer: NodeJS.Timeout | null = null;
+let telegramWorkerUp = false;
+let telegramWorkerProcess: ChildProcess | null = null;
+let shuttingDown = false;
 
 app.use(cors());
 app.use(express.text({ type: "text/plain" }));
@@ -409,6 +413,61 @@ function broadcastSnapshot(): void {
   });
 }
 
+function startTelegramWorker(): void {
+  if (shuttingDown) {
+    return;
+  }
+
+  if (telegramWorkerProcess && telegramWorkerProcess.exitCode === null) {
+    return;
+  }
+
+  const worker = spawn("python", ["../../services/python/telegram_worker.py"], {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  telegramWorkerProcess = worker;
+
+  worker.on("spawn", () => {
+    telegramWorkerUp = true;
+    console.info("[Telegram Worker]: started");
+    broadcastSnapshot();
+  });
+
+  worker.stdout?.on("data", (chunk: Buffer | string) => {
+    const message = String(chunk ?? "").trim();
+    if (message.length > 0) {
+      console.info(`[Telegram Worker]: ${message}`);
+    }
+  });
+
+  worker.stderr?.on("data", (chunk: Buffer | string) => {
+    const message = String(chunk ?? "").trim();
+    if (message.length > 0) {
+      console.error(`[Telegram Worker]: ${message}`);
+    }
+  });
+
+  worker.on("error", (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[Telegram Worker]: ${message}`);
+  });
+
+  worker.on("close", (code, signal) => {
+    telegramWorkerProcess = null;
+    telegramWorkerUp = false;
+    console.warn(`[Telegram Worker]: exited (code=${code ?? "null"}, signal=${signal ?? "null"})`);
+    broadcastSnapshot();
+
+    if (shuttingDown) {
+      return;
+    }
+
+    setTimeout(() => {
+      startTelegramWorker();
+    }, 5_000);
+  });
+}
+
 function withNetworkHeartbeat(baseRuntime: RuntimeState): RuntimeState {
   const zone0Status = baseRuntime.zone0.getRealtimeStatus();
   const zone5State = baseRuntime.zone5.getStateSnapshot();
@@ -439,11 +498,34 @@ function withNetworkHeartbeat(baseRuntime: RuntimeState): RuntimeState {
     };
   });
 
+  const mutableNetwork = nextNetwork as Array<{
+    name: string;
+    endpoint: string;
+    state: "UP" | "DOWN";
+    updatedAt: string;
+  }>;
+
+  const hasTelegramWorker = mutableNetwork.some((s) => s.name === "TELEGRAM_WORKER");
+  if (!hasTelegramWorker) {
+    mutableNetwork.push({
+      name: "TELEGRAM_WORKER",
+      endpoint: "python://telegram_worker.py",
+      state: toConnectionState(telegramWorkerUp),
+      updatedAt: now
+    });
+  } else {
+    const tgWorker = mutableNetwork.find((s) => s.name === "TELEGRAM_WORKER");
+    if (tgWorker) {
+      tgWorker.state = toConnectionState(telegramWorkerUp);
+      tgWorker.updatedAt = now;
+    }
+  }
+
   return {
     ...baseRuntime,
     snapshot: {
       ...baseRuntime.snapshot,
-      network: nextNetwork
+      network: mutableNetwork as RuntimeState["snapshot"]["network"]
     }
   };
 }
@@ -558,6 +640,7 @@ async function scheduleRuntimeStep(): Promise<void> {
 server.listen(port, () => {
   console.log(`[orchestrator] listening on http://localhost:${port}`);
   void oraclePersistence.start();
+  startTelegramWorker();
   llmHeartbeatTimer = setInterval(() => {
     void probeLlmHeartbeat().then(() => {
       broadcastSnapshot();
@@ -580,10 +663,18 @@ server.listen(port, () => {
 });
 
 async function shutdown(): Promise<void> {
+  shuttingDown = true;
+
   if (llmHeartbeatTimer) {
     clearInterval(llmHeartbeatTimer);
     llmHeartbeatTimer = null;
   }
+
+  if (telegramWorkerProcess && telegramWorkerProcess.exitCode === null) {
+    telegramWorkerProcess.kill();
+  }
+  telegramWorkerProcess = null;
+  telegramWorkerUp = false;
 
   try {
     await runtime.zone0.stop();

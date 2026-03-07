@@ -130,6 +130,9 @@ export interface Zone0NewsItem {
   symbol: string;
   headline: string;
   body: string;
+  newsUrl?: string;
+  keywordHint?: string;
+  sourceClass?: "ECONOMIC_PRESS" | "DISCLOSURE" | "RUMOR";
   sentimentHint: number;
   source: "NAVER_NEWS";
   timestamp: string;
@@ -711,6 +714,9 @@ export function createZone0Gateway(): Zone0Gateway {
           symbol,
           headline,
           body,
+          newsUrl: article.link || article.originallink,
+          keywordHint: article.keyword,
+          sourceClass: "ECONOMIC_PRESS",
           sentimentHint: estimateSentimentHint(sentimentSource),
           source: "NAVER_NEWS",
           timestamp: article.publishedAt || nowIso()

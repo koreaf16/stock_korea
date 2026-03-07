@@ -62,10 +62,56 @@ Node.js Orchestrator에 `Zone4Engine`을 붙여 매 tick마다 아래 순서로 
 * Python worker는 deterministic scoring skeleton 단계
 * 즉, 현재는 인터페이스/운영 플로우 중심 구현
 
-### 5.7 DB 매핑 (생성 완료)
-* 광기지수 로그 테이블: `TB_ZONE4_MADNESS_LOG`
+### 5.7 DB 매핑 (Step 1: Raw/Vector 분리)
+* Raw 뉴스 로그 테이블: `TB_ZONE4_NEWS_RAW` (벡터 컬럼 없음)
 * 파티셔닝: 일 단위 RANGE + INTERVAL
-* 인덱스: `IX_Z4_MAD_SYM_TS` (LOCAL)
-* DDL: `db/oracle/init_schema.sql`
+* 인덱스: `IX_Z4_NEWS_SYM_TS` (LOCAL)
+* 이벤트 벡터 저장: `TB_INTEGRATED_VECTOR_STATION.Z4_SENT_VEC` (`VECTOR(768, FLOAT32)`)
+* DDL: `db/oracle/step1_integrated_vector_schema.sql`
 
 ## 대용량 테이블들은 처음부터 오라클 파티셔닝을 감안해서 만들어 가능하면 global index는 쓰지 않도록 해줘 
+
+## 6. Zone 4 고도화 구현 (2026-03)
+현재 코드 기준으로 Zone4는 단순 텍스트 임베딩이 아니라, 시장 충격량/신선도까지 포함하는 하이브리드 파이프라인으로 동작한다.
+
+### 6.1 Raw 수집/저장 확장
+`TB_ZONE4_NEWS_RAW` 저장 시 아래 메타데이터를 함께 기록한다.
+- `NEWS_TS_MS`: 밀리초 단위 타임스탬프
+- `SOURCE_CLASS`, `SOURCE_SCORE`: 출처 등급/신뢰도
+- `KEYWORDS_JSON`, `KEYWORD_STRENGTH`: 촉매 키워드/강도
+- `SPIKE_TS`, `REACTION_LATENCY_MS`, `TEMPO_LABEL`: 반응 레이턴시 및 품질 라벨
+- `SHOCK_SCORE`, `SECTOR_COUPLING_IDX`, `LLM_POTENTIAL_SCORE`: 충격량/섹터 연동/콜드스타트 잠재력
+
+관련 구현:
+- `apps/orchestrator/src/db/oracle-persistence.ts`
+- `db/oracle/step1_integrated_vector_schema.sql`
+
+### 6.2 반응 레이턴시(Tempo) 계산
+- `T_news`: 뉴스 시각 (`TB_ZONE4_NEWS_RAW.news_ts`)
+- `T_spike`: `TB_ZONE1_TICK_RAW`에서 거래량 급증(기준 평균 대비 3배) 최초 시점
+- `ΔT = T_spike - T_news`
+- 라벨:
+  - `<= 1초`: `HIGH_QUALITY`
+  - `>= 60초`: `LOW_QUALITY`
+  - 그 외: `MID_QUALITY`
+  - 미탐지: `NO_SPIKE`
+
+### 6.3 RTX 3090 하이브리드 임베딩(768d)
+`services/python/zone_integrated_miner.py`에서 Z4 임베딩을 아래처럼 구성한다.
+- Text embedding 700d: 뉴스/메타 텍스트를 임베딩 후 700차원으로 정규 투영
+- Numeric feature 68d: `ΔT`, 출처신뢰도, 키워드강도, 섹터커플링, shock, zero-shot score 등 수치 피처
+- 최종 768d: `[700d text] + [68d numeric]` 결합 후 L2 정규화
+- 저장 컬럼: `TB_INTEGRATED_VECTOR_STATION.Z4_SENT_VEC`
+
+### 6.4 수익률 가중 유사도 검색
+- Node Zone5 유사도 쿼리에서 `VECTOR_DISTANCE(..., COSINE)` 기반 가중합을 계산
+- Z4는 `profit_rate` 양수 구간에 가중치를 부여한 `news_weighted_score`를 별도 산출
+- 결과로 `z4ExpectedProfitRate`, `z4TopCases`를 만들고 LLM 입력 payload에 포함
+
+관련 구현:
+- `apps/orchestrator/src/zones/zone5/decision.ts`
+
+### 6.5 콜드스타트 보강
+- 라벨 데이터 부족 시 Rule + Zero-shot LLM 혼합 판단
+- 목적은 초기 수익 극대화가 아니라 고해상도 라벨 데이터 축적
+- Zone4 쪽에서도 zero-shot 잠재력 점수(`LLM_POTENTIAL_SCORE`)를 피처에 주입

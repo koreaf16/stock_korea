@@ -63,10 +63,13 @@ Node.js Orchestrator에 `Zone2Engine`을 붙여 매 tick마다 아래 순서로 
 * DART/KRX/FnGuide 실크롤링은 Python 워커 mock/deterministic 단계
 * 즉, 현재는 인터페이스/운영 플로우 중심의 skeleton 구현
 
-### 5.8 DB 매핑 (생성 완료)
+### 5.8 DB 매핑 (Step 1: Raw/Vector 분리)
 * 리스크 캐시 테이블: `TB_ZONE2_FUNDAMENTAL`
 * 인덱스: `IX_Z2_FUND_CHECKED_AT`
-* DDL: `db/oracle/init_schema.sql`
+* 이벤트 벡터 저장: `TB_INTEGRATED_VECTOR_STATION.Z2_FUND_VEC` (`VECTOR(256, FLOAT32)`)
+* DDL:
+  * `db/oracle/init_schema.sql`
+  * `db/oracle/step1_integrated_vector_schema.sql`
 
 ## 대용량 테이블들은 처음부터 오라클 파티셔닝을 감안해서 만들어 가능하면 global index는 쓰지 않도록 해줘 
 ## 벡터인덱스는 어쩔수 없는경우에는 그냥 global index를 써도 되

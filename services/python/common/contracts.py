@@ -13,6 +13,14 @@ def now_iso() -> str:
 class Zone2Fundamental(BaseModel):
     symbol: str
     risk_flag: Literal["CLEAR", "BLOCKED"]
+    risk_score: float = 1.0
+    rule_risk_score: float = 1.0
+    vector_risk_score: float = 1.0
+    similar_pump_score: float = 0.0
+    similar_delist_score: float = 1.0
+    disclosure_toxicity_score: float = 1.0
+    vector_latency_ms: float = 0.0
+    safe_mode: bool = True
     issues: list[str] = Field(default_factory=list)
     has_cb_bw_issue: bool = False
     has_krx_warning: bool = False

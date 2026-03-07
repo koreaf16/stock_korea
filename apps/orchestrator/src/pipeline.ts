@@ -89,7 +89,7 @@ export async function stepRuntime(prev: RuntimeState): Promise<RuntimeState> {
   const targetTechnical = resolveTargetTechnical(targetSymbol, incomingTechnical, prevSnapshot);
   const latestMarketFlow = TARGET_MANAGER.latestFundamentalBySymbol.get(targetSymbol) ?? null;
 
-  const fundamental = prev.zone2.evaluate({
+  const fundamental = await prev.zone2.evaluate({
     symbol: targetSymbol,
     previous: prevSnapshot.fundamental,
     tickCount,

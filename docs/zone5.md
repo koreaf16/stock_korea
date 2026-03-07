@@ -13,12 +13,14 @@ Zone 1~4의 실시간 분석 결과와 Zone 6 과거 피드백, 내 계좌 상�
 1. **리스크 최우선**
    * Kill-Switch 활성화 또는 Zone2 `BLOCKED`면 즉시 `PASS`/청산 우선
    * 예수금이 최소 기준 미만이면 신규 진입 차단
-2. **승률 극대화 진입**
-   * Zone3가 `CLASS_A` + 유사도 임계치 이상
-   * Zone4가 요구 stage(기본 `STAGE_2`) 이상 충족
-   * Zone6 승률 기반으로 진입 비중 동적 조정
-3. **과거 실패 패턴 페널티**
-   * Zone6 `winRate`가 낮으면 진입 비중 자동 축소
+2. **통합 벡터 유사도 검색**
+   * `TB_INTEGRATED_VECTOR_STATION`에서 `VECTOR_DISTANCE` 기반 Top-K 검색
+   * Z1~Z4 유사도를 가중합하여 단일 유사도 점수 산출
+   * 과거 `PROFIT_RATE` 라벨을 함께 집계해 기대값/승률 반영
+3. **Cold Start 하이브리드 분기**
+   * 유사 샘플 부족 시 Z1 수급 임계치(거래대금 폭발/체결 강도/호가 불균형) 1차 체크
+   * LLM Zero-shot으로 “데이터 공백 상태에서 Z3+Z4 진입 타당성” 추가 판단
+   * 초기 구간은 수익 극대화보다 고해상도 데이터 수집 목적의 소량 모의매매 우선
 4. **결정 스냅샷 생성**
    * 의사결정 시점의 핵심 상태를 `Zone5StateArchive` JSON으로 생성
 
@@ -41,10 +43,13 @@ Zone 1~4의 실시간 분석 결과와 Zone 6 과거 피드백, 내 계좌 상�
 ### 5.2 엔진 구조 (`Zone5Engine`)
 `createZone5Engine()` 기반 상태형 엔진으로 동작합니다.
 * `evaluate(input)`
-  * provider(`AUTO`/`LLM`/`RULE`) 기준 최종 결단 생성
-  * LLM 실패 시(`AUTO`) 규칙 엔진으로 자동 fallback
+  * safety gate(`kill-switch`, `risk-flag`, `min-cash`) 우선 평가
+  * Oracle 통합 벡터 유사도 검색 후 warm/cold 경로 분기
+  * cold-start에서는 Z1 임계치 + zero-shot LLM/휴리스틱으로 소량 진입 판단
+  * warm-state에서는 가중 유사도 + 라벨 기반 기대값으로 결단
+  * LLM 실패 시(`AUTO`) 규칙/하이브리드 엔진으로 fallback
 * `getStateSnapshot()`
-  * 최근 source, decision, error, action-order, archive JSON 조회
+  * 최근 source, decision, error, vector-search 상태, action-order, archive JSON 조회
 
 ### 5.3 Provider 모델
 * `ZONE5_PROVIDER=RULE`: 로컬 룰만 사용
@@ -80,10 +85,21 @@ OpenAI-compatible `/chat/completions`를 호출하고, JSON 응답만 허용합�
 * `ZONE5_MAX_WEIGHT`
 * `ZONE5_MIN_PATTERN_SIMILARITY`
 * `ZONE5_REQUIRED_MADNESS_STAGE`
+* `ZONE5_VECTOR_SEARCH_ENABLED`
+* `ZONE5_VECTOR_TOP_K`
+* `ZONE5_VECTOR_MIN_SIMILAR_ROWS`
+* `ZONE5_VECTOR_MIN_LABELED_ROWS`
+* `ZONE5_VECTOR_MIN_WEIGHTED_SIMILARITY`
+* `ZONE5_VEC_WEIGHT_Z1`, `ZONE5_VEC_WEIGHT_Z2`, `ZONE5_VEC_WEIGHT_Z3`, `ZONE5_VEC_WEIGHT_Z4`
+* `ZONE5_COLD_Z1_SPIKE_THRESHOLD`
+* `ZONE5_COLD_Z1_VOLUME_POWER_THRESHOLD`
+* `ZONE5_COLD_Z1_IMBALANCE_MAX`
+* `ZONE5_COLLECTION_WEIGHT_PCT`
+* `ZONE5_COLLECTION_TARGET_LABELED_ROWS`
 
 ### 5.8 현재 한계
 * Oracle 실주문/체결 DB 연동은 미구현 (현재는 시뮬레이션 체결)
-* Zone6 실벡터 검색 연동 전이라 history 입력은 skeleton 기반
+* Z1~Z4 실임베딩 벡터를 직접 질의하지 않고, 런타임 수치 기반 의사벡터로 검색
 * LLM prompt/guardrail은 1차 버전이며 도메인 튜닝은 TODO
 
 ### 5.9 DB 매핑 (생성 완료)

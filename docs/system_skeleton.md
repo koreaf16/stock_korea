@@ -25,12 +25,13 @@ DB 생성/운영 관련 내용은 `docs/db.md`를 기준으로 관리합니다.
 - Command: `npm run db:init`
 - Zone table mapping:
   - Zone0: `TB_ZONE0_EVENT_RAW`
-  - Zone1: `TB_ZONE1_TECHNICAL_LOG`
+  - Zone1: `TB_ZONE1_TICK_RAW`
   - Zone2: `TB_ZONE2_FUNDAMENTAL`
-  - Zone3: `TB_ZONE3_PATTERN_LIBRARY` (+ `IX_Z3_PATTERN_VEC`)
-  - Zone4: `TB_ZONE4_MADNESS_LOG`
+  - Zone3: `TB_ZONE3_CANDLE_RAW`
+  - Zone4: `TB_ZONE4_NEWS_RAW`
   - Zone5: `TB_ZONE5_DECISION_LOG`
-  - Zone6: `TB_TRADE_HISTORY` (+ `IX_Z6_TRADE_VEC`)
+  - Zone6: `TB_TRADE_HISTORY`
+  - Integrated vectors: `TB_INTEGRATED_VECTOR_STATION` (`IX_IVS_Z1_TECH_HNSW`, `IX_IVS_Z2_FUND_HNSW`, `IX_IVS_Z3_CHART_HNSW`, `IX_IVS_Z4_SENT_HNSW`)
 - Partition policy:
   - 대용량 로그 테이블(Zone0/1/4/5/6)은 RANGE + INTERVAL 파티셔닝
   - 일반 인덱스는 LOCAL 우선

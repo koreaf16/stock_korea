@@ -54,11 +54,12 @@ Zone0의 `tick + orderBook`를 입력으로 받아 상태 누적 계산합니다
 * KIS 원시 체결강도 미수신 구간에서는 Volume Power가 추정식 fallback으로 계산됨
 * 1초 고정 tick 전제이므로 실시간 가변 지연 환경 보정 로직은 미구현
 
-### 5.6 DB 매핑 (생성 완료)
-* 기술지표 로그 적재 대상 테이블: `TB_ZONE1_TECHNICAL_LOG`
+### 5.6 DB 매핑 (Step 1: Raw/Vector 분리)
+* Raw 틱 로그 테이블: `TB_ZONE1_TICK_RAW` (벡터 컬럼 없음)
 * 파티셔닝: 일 단위 RANGE + INTERVAL
-* 인덱스: `IX_Z1_TECH_SYM_TS` (LOCAL)
-* DDL: `db/oracle/init_schema.sql`
+* 인덱스: `IX_Z1_TICK_SYM_TS` (LOCAL)
+* 이벤트 벡터 저장: `TB_INTEGRATED_VECTOR_STATION.Z1_TECH_VEC` (`VECTOR(128, FLOAT32)`)
+* DDL: `db/oracle/step1_integrated_vector_schema.sql`
 
 ## 대용량 테이블들은 처음부터 오라클 파티셔닝을 감안해서 만들어 가능하면 global index는 쓰지 않도록 해줘 
 ## 벡터인덱스는 어쩔수 없는경우에는 그냥 global index를 써도 되

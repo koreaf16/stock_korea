@@ -61,13 +61,12 @@ Node.js Orchestrator에 `Zone3Engine`을 붙여 매 tick마다 아래 순서로 
 * Python data miner(과거 분봉 라벨링) 및 Oracle 벡터 적재 파이프라인은 TODO
 * 현재는 인터페이스/엔진/운영 플로우 중심의 skeleton 구현
 
-### 5.8 DB 매핑 (생성 완료)
-* 패턴 라이브러리 테이블: `TB_ZONE3_PATTERN_LIBRARY`
-* 벡터 컬럼: `PATTERN_VECTOR VECTOR(1024, FLOAT32)`
-* 인덱스:
-  * `IX_Z3_CLASS_CREATED`
-  * `IX_Z3_PATTERN_VEC` (VECTOR)
-* DDL: `db/oracle/init_schema.sql`
+### 5.8 DB 매핑 (Step 1: Raw/Vector 분리)
+* Raw 캔들 로그 테이블: `TB_ZONE3_CANDLE_RAW` (벡터 컬럼 없음)
+* 파티셔닝: 일 단위 RANGE + INTERVAL
+* 인덱스: `IX_Z3_CANDLE_SYM_TS` (LOCAL)
+* 이벤트 벡터 저장: `TB_INTEGRATED_VECTOR_STATION.Z3_CHART_VEC` (`VECTOR(512, FLOAT32)`)
+* DDL: `db/oracle/step1_integrated_vector_schema.sql`
 
 ## 대용량 테이블들은 처음부터 오라클 파티셔닝을 감안해서 만들어 가능하면 global index는 쓰지 않도록 해줘 
 ## 벡터인덱스는 어쩔수 없는경우에는 그냥 global index를 써도 되
